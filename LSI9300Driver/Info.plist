@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Info.plist for LSI9300Driver.dext
+    DriverKit extension bundle descriptor for macOS 12.0+
+
+    Device matching:
+      Vendor  0x1000  Broadcom / LSI Logic / Avago
+      Device  0x0097  SAS3008  (LSI 9300-8i / 9300-4i in IT mode)
+      Device  0x0086  SAS3004  (LSI 9300-4i)
+      Device  0x005D  SAS3108  (LSI 9300-8e)
+-->
+<plist version="1.0">
+<dict>
+
+    <!-- ================================================================
+         Bundle identity
+         ================================================================ -->
+    <key>CFBundleIdentifier</key>
+    <string>com.claudekernellsi.driver.LSI9300Driver</string>
+
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <key>CFBundleExecutable</key>
+    <string>LSI9300Driver</string>
+
+    <!-- DEXT = DriverKit extension (user-space driver bundle type) -->
+    <key>CFBundlePackageType</key>
+    <string>DEXT</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- ================================================================
+         IOKit personalities — one personality per supported device ID
+         ================================================================ -->
+    <key>IOKitPersonalities</key>
+    <dict>
+
+        <!-- ------------------------------------------------------------ -->
+        <!-- SAS3008 — LSI 9300-8i (8-port internal SAS3) in IT mode       -->
+        <!-- ------------------------------------------------------------ -->
+        <key>LSI9300_SAS3008</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+
+            <!-- Kernel-side proxy class for DriverKit SCSI controller -->
+            <key>IOClass</key>
+            <string>IOUserSCSIParallelInterfaceController</string>
+
+            <!-- Our DriverKit class name -->
+            <key>IOUserClass</key>
+            <string>LSI9300Driver</string>
+
+            <!-- Match against PCI devices -->
+            <key>IOProviderClass</key>
+            <string>IOPCIDevice</string>
+
+            <key>IOMatchCategory</key>
+            <string>IODefaultMatchCategory</string>
+
+            <!--
+                IOPCIMatch format: 0xDDDDVVVV (device[31:16], vendor[15:0])
+                SAS3008 IT mode: device=0x0097, vendor=0x1000
+            -->
+            <key>IOPCIMatch</key>
+            <string>0x00971000</string>
+
+            <!--
+                PCI class 0x0104xx = Mass Storage Controller / Serial Attached SCSI
+                Mask 0xFFFF0000 matches any programming interface byte.
+            -->
+            <key>IOPCIClassMatch</key>
+            <string>0x01040000&amp;0xFFFF0000</string>
+
+            <!-- SCSI stack integration properties -->
+            <key>IOSCSIParallelInterfaceDeviceCount</key>
+            <integer>256</integer>
+
+            <key>HBAAdapterTypeSAS</key>
+            <true/>
+
+            <!-- Probe score: higher = preferred over generic drivers -->
+            <key>IOProbeScore</key>
+            <integer>2000</integer>
+
+            <!-- DriverKit server options -->
+            <key>IOUserServerName</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+
+            <key>IOUserServerOneProcess</key>
+            <true/>
+        </dict>
+
+        <!-- ------------------------------------------------------------ -->
+        <!-- SAS3004 — LSI 9300-4i (4-port internal) in IT mode            -->
+        <!-- ------------------------------------------------------------ -->
+        <key>LSI9300_SAS3004</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+            <key>IOClass</key>
+            <string>IOUserSCSIParallelInterfaceController</string>
+            <key>IOUserClass</key>
+            <string>LSI9300Driver</string>
+            <key>IOProviderClass</key>
+            <string>IOPCIDevice</string>
+            <key>IOMatchCategory</key>
+            <string>IODefaultMatchCategory</string>
+
+            <!-- SAS3004: device=0x0086, vendor=0x1000 -->
+            <key>IOPCIMatch</key>
+            <string>0x00861000</string>
+
+            <key>IOPCIClassMatch</key>
+            <string>0x01040000&amp;0xFFFF0000</string>
+
+            <key>IOSCSIParallelInterfaceDeviceCount</key>
+            <integer>256</integer>
+            <key>HBAAdapterTypeSAS</key>
+            <true/>
+            <key>IOProbeScore</key>
+            <integer>2000</integer>
+            <key>IOUserServerName</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+            <key>IOUserServerOneProcess</key>
+            <true/>
+        </dict>
+
+        <!-- ------------------------------------------------------------ -->
+        <!-- SAS3108 — LSI 9300-8e (8-port external) in IT mode            -->
+        <!-- ------------------------------------------------------------ -->
+        <key>LSI9300_SAS3108</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+            <key>IOClass</key>
+            <string>IOUserSCSIParallelInterfaceController</string>
+            <key>IOUserClass</key>
+            <string>LSI9300Driver</string>
+            <key>IOProviderClass</key>
+            <string>IOPCIDevice</string>
+            <key>IOMatchCategory</key>
+            <string>IODefaultMatchCategory</string>
+
+            <!-- SAS3108: device=0x005D, vendor=0x1000 -->
+            <key>IOPCIMatch</key>
+            <string>0x005D1000</string>
+
+            <key>IOPCIClassMatch</key>
+            <string>0x01040000&amp;0xFFFF0000</string>
+
+            <key>IOSCSIParallelInterfaceDeviceCount</key>
+            <integer>256</integer>
+            <key>HBAAdapterTypeSAS</key>
+            <true/>
+            <key>IOProbeScore</key>
+            <integer>2000</integer>
+            <key>IOUserServerName</key>
+            <string>com.claudekernellsi.driver.LSI9300Driver</string>
+            <key>IOUserServerOneProcess</key>
+            <true/>
+        </dict>
+
+    </dict>
+
+    <!-- ================================================================
+         System extension metadata (shown in Security & Privacy prefs)
+         ================================================================ -->
+    <key>OSBundleUsageDescription</key>
+    <string>LSI9300Driver enables SAS/SATA disk access via LSI 9300-series host bus adapters connected through Thunderbolt PCIe enclosures.</string>
+
+    <!-- ================================================================
+         DriverKit transport entitlements (declared here AND in .entitlements)
+         ================================================================ -->
+    <key>com.apple.developer.driverkit.transport.pci</key>
+    <true/>
+
+    <key>com.apple.developer.driverkit.family.scsi-controller</key>
+    <true/>
+
+    <!-- Required for DriverKit extensions on macOS 12+ -->
+    <key>OSBundleRequired</key>
+    <string>Safe Boot</string>
+
+</dict>
+</plist>

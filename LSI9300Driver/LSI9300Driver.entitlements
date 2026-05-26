@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    LSI9300Driver.entitlements
+    Code-signing entitlements for the LSI9300Driver DriverKit extension.
+
+    These entitlements must be present in BOTH:
+      1. The code-signing entitlements file (this file)
+      2. The Apple Developer provisioning profile issued for this bundle ID
+
+    To obtain the required entitlements:
+      1. Log in to developer.apple.com
+      2. Create an App ID for "com.claudekernellsi.driver.LSI9300Driver"
+         with the "DriverKit" and "SCSI Controller" capabilities checked.
+      3. Create a provisioning profile (System Extension type).
+      4. Download and embed in the Xcode project.
+
+    Note: DriverKit extensions do NOT use the standard app sandbox.
+    The "com.apple.security.app-sandbox" key must be absent or false.
+-->
+<plist version="1.0">
+<dict>
+
+    <!-- ================================================================
+         Core DriverKit entitlements (all dext require these)
+         ================================================================ -->
+
+    <!-- Marks this binary as a DriverKit extension -->
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+
+    <!-- ================================================================
+         Transport family entitlements
+         ================================================================ -->
+
+    <!--
+        PCI transport: allows the dext to call IOPCIDevice methods
+        (MapMemory, ConfigurationRead/Write, etc.)
+    -->
+    <key>com.apple.developer.driverkit.transport.pci</key>
+    <true/>
+
+    <!-- ================================================================
+         I/O family entitlements
+         ================================================================ -->
+
+    <!--
+        SCSI controller family: allows the dext to subclass
+        IOUserSCSIParallelInterfaceController and submit/complete
+        SCSI parallel tasks to the storage stack.
+    -->
+    <key>com.apple.developer.driverkit.family.scsi-controller</key>
+    <true/>
+
+    <!-- ================================================================
+         Application identity (required for code signing)
+         ================================================================ -->
+
+    <!--
+        Replace $(AppIdentifierPrefix) with your 10-character Team ID,
+        e.g. "A1B2C3D4E5.com.claudekernellsi.driver.LSI9300Driver"
+    -->
+    <key>com.apple.application-identifier</key>
+    <string>$(AppIdentifierPrefix)com.claudekernellsi.driver.LSI9300Driver</string>
+
+    <key>com.apple.developer.team-identifier</key>
+    <string>$(TeamIdentifierPrefix)</string>
+
+    <!-- ================================================================
+         Explicit denials (security hardening)
+         ================================================================ -->
+
+    <!--
+        Do NOT enable app sandbox for drivers; it is incompatible
+        with DriverKit's restricted execution environment.
+    -->
+    <!-- <key>com.apple.security.app-sandbox</key><false/> -->
+
+    <!--
+        Do not allow arbitrary user client connections from third-party apps
+        unless you implement a custom IOUserClient subclass with access controls.
+    -->
+    <key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+    <false/>
+
+</dict>
+</plist>

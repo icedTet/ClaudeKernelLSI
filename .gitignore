@@ -1,0 +1,25 @@
+# Build output
+build/
+*.o
+*.dSYM/
+
+# Xcode artifacts
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xccheckout
+
+# macOS finder artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Code signing artifacts
+*.mobileprovision
+*.p12
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
+*~
