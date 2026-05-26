@@ -22,6 +22,7 @@
 #include <DriverKit/IOTimerDispatchSource.h>
 #include <DriverKit/IODMACommand.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/OSDictionary.h>
 #include <PCIDriverKit/IOPCIDevice.h>
 #include <SCSIControllerDriverKit/IOUserSCSIParallelInterfaceController.h>
 
@@ -56,17 +57,27 @@ static constexpr uint32_t kDoorbellTimeoutMS    = 5000U;
  * ========================================================================= */
 
 struct MPT3CommandContext {
-    /** Physical address of the DMA-able data buffer for this command */
-    uint64_t            dataPhysAddr;
+    /**
+     * Completion OSAction retained from UserProcessParallelTask.
+     * Released and NULLed after ParallelTaskCompletion() is called.
+     */
+    OSAction               *completion;
+
+    /** The framework's unique identifier for this task (from SCSIUserParallelTask.fControllerTaskIdentifier) */
+    uint64_t                controllerTaskID;
+
+    /** Target device identifier (from SCSIUserParallelTask.fTargetID) */
+    SCSITargetIdentifier    targetID;
+
     /** Physical address of the pre-allocated sense buffer */
-    uint64_t            sensePhysAddr;
+    uint64_t                sensePhysAddr;
+
     /** Virtual pointer to the request frame in the pool */
-    MPT3SCSIIORequest  *requestFrame;
-    /** The SCSIParallelTask token from DriverKit */
-    SCSIParallelTaskIdentifier  task;
+    MPT3SCSIIORequest      *requestFrame;
+
     /** Whether this slot is in use */
-    bool                inUse;
-    uint8_t             _pad[7];
+    bool                    inUse;
+    uint8_t                 _pad[7];
 };
 
 /* =========================================================================
@@ -75,94 +86,131 @@ struct MPT3CommandContext {
 
 class LSI9300Driver final : public IOUserSCSIParallelInterfaceController {
 
-    // DriverKit macro – declares the class in the dext namespace
+    // DriverKit mandatory class-registration macro.
+    // Generates the inner types (Start_Impl, etc.) required by the IMPL macro.
+    OSDeclareDefaultStructors(LSI9300Driver);
+
     using super = IOUserSCSIParallelInterfaceController;
 
 public:
 
     /* ------------------------------------------------------------------
-     * IOService lifecycle
+     * IOService lifecycle  (DriverKit: defined with IMPL macro in .cpp)
      * ------------------------------------------------------------------ */
 
     /**
      * Called by the kernel when a matching PCI device is found.
-     * Performs:
-     *   1. PCI resource enumeration (BARs, MSI-X)
-     *   2. MPT3 controller reset and IOCFacts handshake
-     *   3. Descriptor pool allocation (DMA)
-     *   4. IOCInit to bring the controller online
-     *   5. Event notification enable
-     *   6. Port enable (triggers SAS/SATA discovery)
+     * Saves the PCI device reference, then calls super::Start which
+     * causes the framework to invoke UserInitializeController and
+     * UserStartController in sequence.
      */
     virtual kern_return_t Start(IOService *provider) override;
 
     /**
      * Called during device removal or system shutdown.
-     * Issues an IOC reset then releases all DMA pools and interrupt sources.
+     * Issues an IOC reset, releases all DMA pools and interrupt sources,
+     * then calls super::Stop.
      */
     virtual kern_return_t Stop(IOService *provider) override;
 
     /* ------------------------------------------------------------------
-     * IOUserSCSIParallelInterfaceController overrides
+     * IOUserSCSIParallelInterfaceController — pure-virtual overrides
+     *
+     * Called by the framework after Start() completes, in this order:
+     *   1. UserInitializeController  — hardware init, DMA pools, IOCInit
+     *   2. UserStartController       — enable interrupts, port enable
      * ------------------------------------------------------------------ */
 
     /**
-     * Return the maximum number of logical units per target.
-     * SAS drives expose a single LUN 0; expanders can have more.
+     * Open the PCI device, map BAR1, soft-reset the IOC, issue IOCFacts,
+     * allocate DMA descriptor pools, and send IOCInit.
+     * Called by the framework immediately after Start() returns success.
      */
-    virtual uint32_t      ReportHBASpecificDeviceData(void) override;
+    virtual kern_return_t UserInitializeController() override;
 
     /**
-     * Return the maximum number of outstanding tasks per target.
+     * Set up the MSI-X interrupt source, unmask reply interrupts,
+     * enable async event notifications, and send PortEnable.
+     * Called by the framework after UserInitializeController() succeeds.
      */
-    virtual uint32_t      ReportMaximumTaskCount(void) override;
-
-    /**
-     * Return the maximum supported CDB length.
-     */
-    virtual uint32_t      ReportMaxSupportedTaskCount(void) override;
+    virtual kern_return_t UserStartController() override;
 
     /**
      * Called for each new SCSI task submitted by the storage stack.
-     * Builds an MPT3SCSIIORequest frame, posts the descriptor, returns
-     * kSCSIServiceResponse_Request_In_Process on success.
+     * Builds an MPT3SCSIIORequest frame and posts it to hardware.
+     *
+     * @param parallelRequest  All I/O metadata (CDB, DMA address, target, …).
+     * @param response         Output: synchronous service response code.
+     * @param completion       OSAction to invoke when the I/O completes.
      */
-    virtual SCSIServiceResponse ProcessParallelTask(
-                                    SCSIParallelTaskIdentifier parallelRequest) override;
+    virtual kern_return_t UserProcessParallelTask(
+                              SCSIUserParallelTask  parallelRequest,
+                              uint32_t             *response,
+                              OSAction             *completion) override;
 
     /**
-     * Called to abort a specific task (TMF ABORT_TASK).
+     * Called by the framework to allocate per-task HBA data.
+     * We use the SMID free-list for task tracking, so just return success.
      */
-    virtual SCSIServiceResponse AbortTask(
-                                    SCSITargetIdentifier targetID,
-                                    SCSILogicalUnitNumber logicalUnitNumber,
-                                    SCSITaggedTaskIdentifier taggedTaskID) override;
+    virtual kern_return_t UserMapHBAData(uint32_t *uniqueTaskID) override;
 
     /**
-     * Called to reset a target (TMF TARGET_RESET).
+     * Report whether the hardware performs auto-sense.
+     * The SAS3008 always writes autosense data into the pre-allocated
+     * sense buffer, so we return true.
      */
-    virtual SCSIServiceResponse AbortTaskSet(
-                                    SCSITargetIdentifier targetID,
-                                    SCSILogicalUnitNumber logicalUnitNumber) override;
+    virtual kern_return_t UserDoesHBAPerformAutoSense(bool *result) override;
+
+    /* ------------------------------------------------------------------
+     * IOUserSCSIParallelInterfaceController — optional virtual overrides
+     * ------------------------------------------------------------------ */
+
+    virtual kern_return_t UserDoesHBAPerformDeviceManagement(
+                              bool *result) override;
+
+    virtual kern_return_t UserReportMaximumTaskCount(
+                              uint32_t *count) override;
+
+    virtual kern_return_t UserReportHighestSupportedDeviceID(
+                              uint64_t *id) override;
+
+    virtual kern_return_t UserReportInitiatorIdentifier(
+                              uint64_t *id) override;
+
+    virtual kern_return_t UserReportHBAHighestLogicalUnitNumber(
+                              uint64_t *value) override;
 
     /**
-     * Called to reset the entire HBA.
+     * Report HBA DMA constraints via key–value pairs in constraints dict.
      */
-    virtual bool              InitializeController(void) override;
-    virtual void              TerminateController(void) override;
+    virtual kern_return_t UserReportHBAConstraints(
+                              OSDictionary *constraints) override;
 
     /**
-     * Report HBA constraints to the storage layer.
+     * Report DMA segment parameters so the framework can prepare DMA properly.
      */
-    virtual void              ReportHBAConstraints(
-                                    IOMapper *mapper,
-                                    SCSIDeviceIdentifier *maxDeviceID,
-                                    SCSILogicalUnitNumber *maxLUN,
-                                    uint32_t *maxIOSize,
-                                    uint32_t *maxSegmentCount,
-                                    uint64_t *maxSegmentSize,
-                                    uint64_t *maxAddressableSegment,
-                                    uint32_t *alignmentMask) override;
+    virtual kern_return_t UserGetDMASpecification(
+                              uint64_t             *maxTransferSize,
+                              uint32_t             *alignment,
+                              uint8_t              *numAddressBits,
+                              DMAOutputSegmentType *segmentType) override;
+
+    /**
+     * Abort a specific task (TMF ABORT_TASK).
+     */
+    virtual kern_return_t UserAbortTaskRequest(
+                              uint64_t  theT,
+                              uint64_t  theL,
+                              uint64_t  theQ,
+                              uint32_t *response) override;
+
+    /**
+     * Abort all tasks for a target/LUN (TMF ABORT_TASK_SET).
+     */
+    virtual kern_return_t UserAbortTaskSetRequest(
+                              uint64_t  theT,
+                              uint64_t  theL,
+                              uint32_t *response) override;
 
 private:
 
@@ -189,11 +237,6 @@ private:
      * Doorbell-based handshake: send a request frame word-by-word and read
      * back the reply.  Used only for IOCFacts and IOCInit before the DMA
      * pools are live.
-     *
-     * @param req      Pointer to the request frame
-     * @param reqWords Size of the request in 32-bit words
-     * @param reply    Buffer to receive the reply (up to replyWords words)
-     * @param replyWords Maximum reply size in 32-bit words
      */
     kern_return_t   DoorbellHandshake(const uint32_t *req,
                                       uint32_t        reqWords,
@@ -208,9 +251,7 @@ private:
      *   - Request frames       (kNumRequestFrames × MPT3_REQUEST_FRAME_SIZE)
      *   - Reply frame pool     (kNumReplyFrames   × MPT3_REPLY_FRAME_SIZE)
      *   - Reply free queue ring (kNumReplyFrames  × sizeof(uint32_t))
-     *     [DMA ring of 32-bit reply frame PAs — IOC reads from this]
      *   - Reply post queue ring (kReplyQueueDepth × MPT3_REPLY_DESCRIPTOR_SIZE)
-     *     [DMA ring of 8-byte reply descriptors — IOC writes to this]
      *   - Sense buffers        (kNumRequestFrames × kSenseBufferSize)
      */
     kern_return_t   AllocateDMAPools(void);
@@ -219,9 +260,8 @@ private:
     void            FreeDMAPools(void);
 
     /**
-     * Write the physical addresses of all pre-allocated reply frames into the
-     * reply free queue DMA ring and update the host index register.
-     * Must be called after AllocateDMAPools and before SendIOCInit.
+     * Write the physical addresses of all pre-allocated reply frames into
+     * the reply free queue DMA ring and update the host index register.
      */
     void            FillReplyFreeQueue(void);
 
@@ -238,8 +278,6 @@ private:
 
     /**
      * Send PortEnable to trigger SAS/SATA topology discovery.
-     * This is asynchronous; device-added events arrive via the event
-     * notification path.
      */
     kern_return_t   SendPortEnable(void);
 
@@ -258,21 +296,11 @@ private:
 
     /**
      * Post a 64-bit request descriptor to the controller via MMIO.
-     * Both 32-bit halves are written with a barrier between them to
-     * prevent reordering.
      */
     void            PostRequestDescriptor(uint32_t low, uint32_t high);
 
     /**
      * Return a consumed reply frame to the IOC's free pool.
-     *
-     * Writes the reply frame's 32-bit physical address into the next slot
-     * of the reply free queue DMA ring, advances the producer index, and
-     * updates the REPLY_FREE_HOST_INDEX_REG so the IOC can reuse the frame.
-     *
-     * @param replyFramePhys  Full 64-bit physical address of the reply frame.
-     *                        Must be within the first 4 GiB (bits 63:32 == 0
-     *                        or == SenseBufferAddressHigh) per MPI2 spec.
      */
     void            ReturnReplyFrameToFreeQueue(uint64_t replyFramePhys);
 
@@ -281,17 +309,13 @@ private:
      * ------------------------------------------------------------------ */
 
     /**
-     * MSI-X interrupt handler.  Called by IOInterruptDispatchSource.
-     * Drains the reply post queue and dispatches completions.
-     *
-     * @param source   The interrupt source that fired
-     * @param timestamp Time at which the interrupt arrived
+     * MSI-X interrupt handler.
      */
     void            HandleInterrupt(IOInterruptDispatchSource *source,
                                     uint64_t timestamp);
 
     /**
-     * Process a single SCSI IO reply frame.
+     * Process a single SCSI IO reply frame and invoke ParallelTaskCompletion.
      */
     void            CompleteScsiIO(const MPT3SCSIIOReply *reply, uint16_t smid);
 
@@ -301,15 +325,14 @@ private:
     void            HandleEventNotification(const MPT3EventNotificationReply *event);
 
     /**
-     * Build the SGL chain for the given I/O in the request frame.
-     * Uses only the inline SGL entries for small transfers; allocates
-     * chain buffers for larger ones.
+     * Build the single-segment SGL for the given I/O in the request frame.
+     * The framework guarantees one contiguous DMA segment via fBufferIOVMAddr.
      */
     kern_return_t   BuildSGL(MPT3SCSIIORequest          *req,
-                             SCSIParallelTaskIdentifier  task);
+                             const SCSIUserParallelTask &task);
 
     /* ------------------------------------------------------------------
-     * MMIO accessor helpers (barriers enforced by OSWriteLittleInt32 etc.)
+     * MMIO accessor helpers
      * ------------------------------------------------------------------ */
 
     inline uint32_t ReadReg32(uint32_t offset);
@@ -319,14 +342,14 @@ private:
      * Member variables
      * ------------------------------------------------------------------ */
 
-    /** PCI device provider */
+    /** PCI device provider (retained in Start, released in Stop) */
     IOPCIDevice                    *fPCIDevice      = nullptr;
 
     /** MMIO map for BAR1 */
     IOMemoryMap                    *fBAR1Map        = nullptr;
     volatile uint8_t               *fBAR1Base       = nullptr;
 
-    /** MSI-X interrupt dispatch source (one for queue 0) */
+    /** MSI-X interrupt dispatch source (vector 0) */
     IOInterruptDispatchSource      *fInterruptSource = nullptr;
 
     /* --- DMA pool descriptors --- */
@@ -337,8 +360,8 @@ private:
     MPT3SCSIIORequest              *fRequestFrameVirtBase = nullptr;
 
     /**
-     * Reply frame pool — actual 128-byte frames the IOC writes replies into.
-     * Physical addresses of these frames are placed in the free queue ring.
+     * Reply frame pool — 128-byte frames the IOC writes replies into.
+     * Physical addresses of these frames go into the reply free queue ring.
      */
     IOBufferMemoryDescriptor       *fReplyFramePool      = nullptr;
     uint64_t                        fReplyFramePhysBase  = 0;
@@ -346,22 +369,19 @@ private:
 
     /**
      * Reply free queue ring — DMA ring of uint32_t physical addresses.
-     * The host fills this ring with addresses of reply frames; the IOC reads
-     * from it to obtain a frame to write a reply into.
+     * The host fills this with reply frame PAs; the IOC reads from it.
      * ReplyFreeQueueAddress in IOCInit points here.
-     * Entries are 32-bit (reply frames must be in the low 4 GiB).
      */
     IOBufferMemoryDescriptor       *fReplyFreeQueueRing  = nullptr;
     uint64_t                        fReplyFreeRingPhys   = 0;
     uint32_t                       *fReplyFreeRingVirt   = nullptr;
 
-    /** IOBufferMemoryDescriptor for the reply post queue (descriptor ring).
-     *  The IOC writes 8-byte reply descriptors here; the host drains on IRQ. */
+    /** Reply post queue — IOC writes 8-byte reply descriptors here on IRQ */
     IOBufferMemoryDescriptor       *fReplyPostQueue      = nullptr;
     uint64_t                        fReplyPostPhysBase   = 0;
     MPT3ReplyDescriptor            *fReplyPostVirtBase   = nullptr;
 
-    /** IOBufferMemoryDescriptor for SCSI sense buffers */
+    /** Sense buffer pool */
     IOBufferMemoryDescriptor       *fSenseBufferPool     = nullptr;
     uint64_t                        fSensePhysBase       = 0;
     uint8_t                        *fSenseVirtBase       = nullptr;

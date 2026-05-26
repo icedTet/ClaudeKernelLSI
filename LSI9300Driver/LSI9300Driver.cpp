@@ -4,6 +4,12 @@
  * Full implementation of IOUserSCSIParallelInterfaceController for the
  * Broadcom SAS3008 chip (LSI 9300-8i / 9300-4i) operating in IT mode.
  *
+ * DriverKit lifecycle:
+ *   Start()                  → saves PCI device, calls super (triggers below)
+ *   UserInitializeController → PCI open, BAR map, IOC reset, DMA alloc, IOCInit
+ *   UserStartController      → MSI-X, interrupt unmask, PortEnable
+ *   Stop()                   → full hardware teardown
+ *
  * Copyright (c) 2024 ClaudeKernelLSI Project.
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -25,41 +31,38 @@
     os_log_debug(OS_LOG_DEFAULT, "[LSI9300][DBG] " fmt, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// DriverKit class registration macro
-// ---------------------------------------------------------------------------
-
-#define super IOUserSCSIParallelInterfaceController
-IMPL(LSI9300Driver, Start)
-IMPL(LSI9300Driver, Stop)
-
-// ---------------------------------------------------------------------------
 // MMIO accessor helpers
+//
+// OSReadLittleInt32 / OSWriteLittleInt32 are kernel-only; in DriverKit we
+// use direct volatile pointer reads/writes.  On ARM64 (Apple Silicon) the
+// CPU is natively little-endian so no byte-swap is needed.  OSSynchronizeIO()
+// issues a "dmb oshst" to ensure MMIO store ordering.
 // ---------------------------------------------------------------------------
 
 inline uint32_t LSI9300Driver::ReadReg32(uint32_t offset)
 {
-    // OSReadLittleInt32 issues a 32-bit load with acquire semantics on ARM64
-    return OSReadLittleInt32(fBAR1Base, offset);
+    return *(volatile uint32_t *)(fBAR1Base + offset);
 }
 
 inline void LSI9300Driver::WriteReg32(uint32_t offset, uint32_t value)
 {
-    // OSWriteLittleInt32 issues a 32-bit store with release semantics on ARM64
-    OSWriteLittleInt32(fBAR1Base, offset, value);
-    OSSynchronizeIO();           // equivalent to dsb st on ARM64
+    *(volatile uint32_t *)(fBAR1Base + offset) = value;
+    OSSynchronizeIO();   // dmb oshst — ensures store is visible to device
 }
 
 // ===========================================================================
-// Start — called by the kernel when a matching PCI device is found
+// Start — saves the PCI device reference, then calls super.
+//
+// The framework calls UserInitializeController and UserStartController
+// in sequence after super::Start returns success.
 // ===========================================================================
 
-kern_return_t LSI9300Driver::Start(IOService *provider)
+kern_return_t IMPL(LSI9300Driver, Start)(IOService *provider)
 {
-    kern_return_t ret = kIOReturnSuccess;
-
     LSI_LOG("Start: probing LSI 9300 (SAS3008) in IT mode");
 
-    // Retain and open the PCI device
+    // Save the PCI device before calling super — UserInitializeController
+    // does not receive the provider argument and reads fPCIDevice directly.
     fPCIDevice = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCIDevice) {
         LSI_ERR("Start: provider is not an IOPCIDevice");
@@ -67,10 +70,81 @@ kern_return_t LSI9300Driver::Start(IOService *provider)
     }
     fPCIDevice->retain();
 
+    // Call the base class — this registers with the framework and triggers
+    // the UserInitializeController → UserStartController call chain.
+    kern_return_t ret = Start(provider, SUPERDISPATCH);
+    if (ret != kIOReturnSuccess) {
+        LSI_ERR("Start: super::Start failed: 0x%x", ret);
+        OSSafeReleaseNULL(fPCIDevice);
+        return ret;
+    }
+
+    return kIOReturnSuccess;
+}
+
+// ===========================================================================
+// Stop — full hardware teardown
+// ===========================================================================
+
+kern_return_t IMPL(LSI9300Driver, Stop)(IOService *provider)
+{
+    LSI_LOG("Stop: taking LSI 9300 offline");
+
+    fControllerOnline = false;
+
+    // Cancel and release the interrupt source before touching hardware
+    if (fInterruptSource) {
+        fInterruptSource->Cancel();
+        OSSafeReleaseNULL(fInterruptSource);
+    }
+
+    if (fBAR1Base) {
+        MaskInterrupts();
+        (void)SoftResetIOC();    // best-effort reset
+    }
+
+    FreeDMAPools();
+
+    if (fBAR1Map) {
+        OSSafeReleaseNULL(fBAR1Map);
+        fBAR1Base = nullptr;
+    }
+
+    if (fPCIDevice) {
+        fPCIDevice->Close(this, 0);
+        OSSafeReleaseNULL(fPCIDevice);
+    }
+
+    // Release any pending completion OSAction objects
+    for (uint32_t i = 0; i < kNumRequestFrames; i++) {
+        if (fCmdCtx[i].completion) {
+            OSSafeReleaseNULL(fCmdCtx[i].completion);
+            fCmdCtx[i].inUse = false;
+        }
+    }
+
+    return Stop(provider, SUPERDISPATCH);
+}
+
+// ===========================================================================
+// UserInitializeController
+//
+// Called by the framework after Start() returns success.
+// Responsible for: PCI open, BAR map, IOC reset, IOCFacts, DMA pool alloc,
+// IOCInit, and interrupt source setup.
+// ===========================================================================
+
+kern_return_t IMPL(LSI9300Driver, UserInitializeController)()
+{
+    kern_return_t ret;
+
+    LSI_LOG("UserInitializeController: opening PCI device");
+
+    // Open the PCI device (enables config-space and MMIO access)
     ret = fPCIDevice->Open(this, 0);
     if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: failed to open PCI device: 0x%x", ret);
-        goto fail_open;
+        LSI_ERR("UserInitializeController: failed to open PCI device: 0x%x", ret);
+        return ret;
     }
 
     // Enable PCI bus mastering (required for DMA) and memory space decode
@@ -84,55 +158,57 @@ kern_return_t LSI9300Driver::Start(IOService *provider)
     // Map BAR1 (64-bit MMIO, system interface registers)
     ret = fPCIDevice->MapMemory(kIOPCIMemoryRangeBAR1, &fBAR1Map);
     if (ret != kIOReturnSuccess || !fBAR1Map) {
-        LSI_ERR("Start: failed to map BAR1: 0x%x", ret);
+        LSI_ERR("UserInitializeController: failed to map BAR1: 0x%x", ret);
         goto fail_map;
     }
     fBAR1Base = reinterpret_cast<volatile uint8_t *>(fBAR1Map->GetAddress());
-    LSI_LOG("Start: BAR1 mapped at %p (length %llu)", fBAR1Base, fBAR1Map->GetLength());
+    LSI_LOG("UserInitializeController: BAR1 at %p (len %llu)",
+            fBAR1Base, fBAR1Map->GetLength());
 
-    // Mask all host interrupts while we initialise
+    // Mask all interrupts while initialising
     MaskInterrupts();
 
-    // Hard-reset the IOC and wait for READY state
+    // Soft-reset the IOC and wait for READY state
     ret = SoftResetIOC();
     if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: IOC reset failed: 0x%x", ret);
+        LSI_ERR("UserInitializeController: IOC reset failed: 0x%x", ret);
         goto fail_reset;
     }
 
     // Retrieve IOC capabilities
     ret = ReadIOCFacts();
     if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: IOCFacts failed: 0x%x", ret);
+        LSI_ERR("UserInitializeController: IOCFacts failed: 0x%x", ret);
         goto fail_facts;
     }
 
     // Allocate DMA descriptor pools
     ret = AllocateDMAPools();
     if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: DMA pool allocation failed: 0x%x", ret);
+        LSI_ERR("UserInitializeController: DMA pool alloc failed: 0x%x", ret);
         goto fail_dma;
     }
 
     // Populate the reply-free queue with all reply frame physical addresses
     FillReplyFreeQueue();
 
-    // Send IOCInit to give the IOC the queue addresses / depths
+    // Send IOCInit to give the IOC all four queue addresses/depths
     ret = SendIOCInit();
     if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: IOCInit failed: 0x%x", ret);
+        LSI_ERR("UserInitializeController: IOCInit failed: 0x%x", ret);
         goto fail_init;
     }
 
-    // Register MSI-X interrupt handler (vector 0)
+    // Set up the MSI-X interrupt dispatch source (vector 0)
     {
         ret = IOInterruptDispatchSource::Create(
                   fPCIDevice,
-                  0,    // interrupt index (first MSI-X vector)
+                  0,                   // first MSI-X vector
                   GetDispatchQueue(),
                   &fInterruptSource);
         if (ret != kIOReturnSuccess || !fInterruptSource) {
-            LSI_ERR("Start: failed to create interrupt source: 0x%x", ret);
+            LSI_ERR("UserInitializeController: interrupt source create failed: 0x%x",
+                    ret);
             goto fail_irq;
         }
 
@@ -143,45 +219,18 @@ kern_return_t LSI9300Driver::Start(IOService *provider)
                       this,
                       &LSI9300Driver::HandleInterrupt));
         if (ret != kIOReturnSuccess) {
-            LSI_ERR("Start: failed to set interrupt handler: 0x%x", ret);
+            LSI_ERR("UserInitializeController: SetHandler failed: 0x%x", ret);
             goto fail_irq_handler;
         }
 
         ret = fInterruptSource->Activate();
         if (ret != kIOReturnSuccess) {
-            LSI_ERR("Start: failed to activate interrupt source: 0x%x", ret);
+            LSI_ERR("UserInitializeController: Activate failed: 0x%x", ret);
             goto fail_irq_handler;
         }
     }
 
-    // Unmask reply-available interrupt
-    UnmaskInterrupts();
-
-    // Enable async event notifications (discovery, device add/remove)
-    ret = EnableEventNotification();
-    if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: EventNotification failed: 0x%x", ret);
-        // Non-fatal — proceed
-    }
-
-    // Trigger SAS/SATA topology discovery
-    ret = SendPortEnable();
-    if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: PortEnable failed: 0x%x", ret);
-        // Non-fatal — devices may appear later
-    }
-
-    fControllerOnline = true;
-
-    // Call super::Start last to register with the SCSI stack
-    ret = super::Start(provider);
-    if (ret != kIOReturnSuccess) {
-        LSI_ERR("Start: super::Start failed: 0x%x", ret);
-        fControllerOnline = false;
-        goto fail_irq_handler;
-    }
-
-    LSI_LOG("Start: LSI 9300 online — %u credits, FW 0x%08x",
+    LSI_LOG("UserInitializeController: hardware ready — %u credits, FW 0x%08x",
             fIOCFacts.RequestCredit, fIOCFacts.FWVersion);
     return kIOReturnSuccess;
 
@@ -200,45 +249,41 @@ fail_reset:
     fBAR1Base = nullptr;
 fail_map:
     fPCIDevice->Close(this, 0);
-fail_open:
-    OSSafeReleaseNULL(fPCIDevice);
     return ret;
 }
 
 // ===========================================================================
-// Stop — called during device removal or system shutdown
+// UserStartController
+//
+// Called by the framework after UserInitializeController() succeeds.
+// Unmasks reply interrupts, enables event notifications, and triggers
+// SAS/SATA topology discovery via PortEnable.
 // ===========================================================================
 
-kern_return_t LSI9300Driver::Stop(IOService *provider)
+kern_return_t IMPL(LSI9300Driver, UserStartController)()
 {
-    LSI_LOG("Stop: taking LSI 9300 offline");
+    LSI_LOG("UserStartController: enabling I/O");
 
-    fControllerOnline = false;
+    // Unmask the reply-available interrupt now that MSI-X is active
+    UnmaskInterrupts();
 
-    // Cancel and release the interrupt source before touching hardware
-    if (fInterruptSource) {
-        fInterruptSource->Cancel();
-        OSSafeReleaseNULL(fInterruptSource);
+    // Enable async event notifications (SAS discovery, device add/remove)
+    kern_return_t ret = EnableEventNotification();
+    if (ret != kIOReturnSuccess) {
+        LSI_ERR("UserStartController: EventNotification failed: 0x%x", ret);
+        // Non-fatal
     }
 
-    MaskInterrupts();
-
-    // Soft-reset the IOC so drives are not left in an inconsistent state
-    (void)SoftResetIOC();
-
-    FreeDMAPools();
-
-    if (fBAR1Map) {
-        OSSafeReleaseNULL(fBAR1Map);
-        fBAR1Base = nullptr;
+    // Trigger SAS/SATA topology discovery (async; devices appear via events)
+    ret = SendPortEnable();
+    if (ret != kIOReturnSuccess) {
+        LSI_ERR("UserStartController: PortEnable failed: 0x%x", ret);
+        // Non-fatal
     }
 
-    if (fPCIDevice) {
-        fPCIDevice->Close(this, 0);
-        OSSafeReleaseNULL(fPCIDevice);
-    }
-
-    return super::Stop(provider);
+    fControllerOnline = true;
+    LSI_LOG("UserStartController: controller online");
+    return kIOReturnSuccess;
 }
 
 // ===========================================================================
@@ -252,7 +297,7 @@ void LSI9300Driver::MaskInterrupts(void)
 
 void LSI9300Driver::UnmaskInterrupts(void)
 {
-    // Unmask only the reply-available interrupt; leave doorbell masked
+    // Unmask only the reply-available interrupt; keep doorbell masked
     uint32_t mask = MPI3_SYSIF_HOST_INT_MASK_ALL
                   & ~MPI3_SYSIF_HOST_INT_MASK_REPLY;
     WriteReg32(MPI3_SYSIF_HOST_INT_MASK_REG, mask);
@@ -274,8 +319,8 @@ MPT3IOCState LSI9300Driver::ReadIOCState(void)
 
 kern_return_t LSI9300Driver::SoftResetIOC(void)
 {
-    constexpr uint32_t kPollIntervalUS = 10000U;  // 10 ms
-    constexpr uint32_t kMaxPollMS      = 5000U;   // 5 s total
+    constexpr uint32_t kPollIntervalMS = 10U;
+    constexpr uint32_t kMaxPollMS      = 5000U;
 
     LSI_LOG("SoftResetIOC: resetting controller");
 
@@ -307,16 +352,15 @@ kern_return_t LSI9300Driver::SoftResetIOC(void)
     // Step 5: Wait for the IOC to reach READY state
     uint32_t elapsed = 0;
     while (elapsed < kMaxPollMS) {
-        IOSleep(kPollIntervalUS / 1000);
-        elapsed += kPollIntervalUS / 1000;
+        IOSleep(kPollIntervalMS);
+        elapsed += kPollIntervalMS;
         MPT3IOCState st = ReadIOCState();
         if (st == MPI3_IOC_STATE_READY) {
             LSI_LOG("SoftResetIOC: IOC in READY state after %u ms", elapsed);
             return kIOReturnSuccess;
         }
         if (st == MPI3_IOC_STATE_FAULT) {
-            LSI_ERR("SoftResetIOC: IOC in FAULT state (code=0x%04x)",
-                    fIOCFacts.IOCFaultCode);
+            LSI_ERR("SoftResetIOC: IOC in FAULT state");
             return kIOReturnDeviceError;
         }
     }
@@ -328,7 +372,6 @@ kern_return_t LSI9300Driver::SoftResetIOC(void)
 
 // ===========================================================================
 // DoorbellHandshake — send/receive via the legacy doorbell register
-// Used only before DMA queues are initialised (IOCFacts, IOCInit).
 // ===========================================================================
 
 kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
@@ -343,8 +386,7 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
     }
 
     // 2. Write function code + size word to doorbell (triggers the handshake)
-    uint32_t firstWord = req[0];
-    WriteReg32(MPI3_SYSIF_DOORBELL_REG, firstWord);
+    WriteReg32(MPI3_SYSIF_DOORBELL_REG, req[0]);
 
     // 3. Wait for IOC to acknowledge (DOORBELL_STATUS bit clears)
     uint32_t timeout = kDoorbellTimeoutMS;
@@ -360,7 +402,7 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
         return kIOReturnTimeout;
     }
 
-    // 4. Send remaining request words (2 bytes at a time, low byte then high)
+    // 4. Send remaining request words (two 16-bit half-words per DWORD)
     for (uint32_t i = 1; i < reqWords; i++) {
         WriteReg32(MPI3_SYSIF_DOORBELL_REG, req[i] & 0xFFFF);
         IODelay(2);
@@ -383,7 +425,6 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
     }
 
     // 6. Read reply length (in DWORDs) from the doorbell register.
-    //    The IOC writes the DWORD count into bits 15:0 of the doorbell.
     uint32_t replyLenDW = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
     if (replyLenDW == 0 || replyLenDW > replyWords) {
         LSI_ERR("DoorbellHandshake: bad reply length %u DW (max %u)",
@@ -391,26 +432,12 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
         return kIOReturnBadArgument;
     }
 
-    // Acknowledge the "reply-ready" doorbell interrupt before reading data
     WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
 
-    // 7. Read reply data.
-    //
-    // IMPORTANT: The doorbell data path is only 16 bits wide.  The IOC
-    // delivers ONE 16-bit half-word per interrupt, so each 32-bit DWORD
-    // in the reply requires TWO separate interrupt-driven reads.
-    //
-    // Sequence per DWORD:
-    //   a. Wait for DOORBELL_STATUS interrupt (low half-word ready)
-    //   b. Read & acknowledge — saves bits 15:0
-    //   c. Wait for DOORBELL_STATUS interrupt (high half-word ready)
-    //   d. Read & acknowledge — saves bits 31:16
-    //   e. Reassemble: reply[i] = lo | (hi << 16)
-    //
-    // Reference: Linux mpt3sas _base_handshake_req_reply_wait()
+    // 7. Read reply data.  Doorbell is 16-bit wide: two reads per DWORD.
     for (uint32_t i = 0; i < replyLenDW; i++) {
-        // --- low half-word ---
+        // low half-word
         timeout = 200;
         while (timeout--) {
             IODelay(10);
@@ -427,7 +454,7 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
         WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                    MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
 
-        // --- high half-word ---
+        // high half-word
         timeout = 200;
         while (timeout--) {
             IODelay(10);
@@ -444,7 +471,6 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
         WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                    MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
 
-        // Reassemble the full DWORD (little-endian: low half first)
         reply[i] = lo | (hi << 16);
     }
 
@@ -469,11 +495,8 @@ kern_return_t LSI9300Driver::ReadIOCFacts(void)
                             sizeof(req) / sizeof(uint32_t),
                             reply,
                             sizeof(reply) / sizeof(uint32_t));
-    if (ret != kIOReturnSuccess) {
-        return ret;
-    }
+    if (ret != kIOReturnSuccess) return ret;
 
-    // Copy to the stored facts structure
     __builtin_memcpy(&fIOCFacts, reply, sizeof(fIOCFacts));
 
     if (fIOCFacts.Header.IOCStatus != MPI3_IOCSTATUS_SUCCESS) {
@@ -496,7 +519,6 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
 {
     kern_return_t ret;
 
-    // Helper lambda to allocate a DMA-coherent buffer and map it
     auto allocPool = [&](IOBufferMemoryDescriptor **desc,
                          uint64_t *physBase,
                          void    **virtBase,
@@ -506,7 +528,7 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
         ret = IOBufferMemoryDescriptor::Create(
                   kIOMemoryDirectionInOut,
                   size,
-                  0,          // alignment (page-aligned by default)
+                  0,
                   desc);
         if (ret != kIOReturnSuccess || !*desc) {
             LSI_ERR("AllocateDMAPools: failed to create %s pool: 0x%x", name, ret);
@@ -518,13 +540,13 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
             return ret;
         }
         IODMACommandSpecification spec = {
-            .options    = kIODMACommandSpecificationNoOptions,
+            .options        = kIODMACommandSpecificationNoOptions,
             .maxAddressBits = 64,
         };
         IODMACommand *dmaCmd = nullptr;
         ret = IODMACommand::Create(fPCIDevice, 0, &spec, &dmaCmd);
         if (ret != kIOReturnSuccess) {
-            LSI_ERR("AllocateDMAPools: failed to create DMA command for %s: 0x%x",
+            LSI_ERR("AllocateDMAPools: DMA command create failed for %s: 0x%x",
                     name, ret);
             return ret;
         }
@@ -534,7 +556,7 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
             LSI_ERR("AllocateDMAPools: DMA prepare failed for %s: 0x%x", name, ret);
             return ret;
         }
-        LSI_DEBUG("AllocateDMAPools: %s at virt=%p phys=0x%llx size=%zu",
+        LSI_DEBUG("AllocateDMAPools: %s virt=%p phys=0x%llx size=%zu",
                   name, *virtBase, *physBase, size);
         return kIOReturnSuccess;
     };
@@ -547,7 +569,7 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
                     "RequestFrames");
     if (ret != kIOReturnSuccess) return ret;
 
-    // 2a. Reply frame pool  (the actual 128-byte reply frames)
+    // 2a. Reply frame pool (128-byte frames)
     ret = allocPool(&fReplyFramePool,
                     &fReplyFramePhysBase,
                     reinterpret_cast<void **>(&fReplyFrameVirtBase),
@@ -555,23 +577,14 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
                     "ReplyFrames");
     if (ret != kIOReturnSuccess) return ret;
 
-    // Verify reply frames are in the first 4 GiB (MPI2 spec requirement).
-    // The reply free queue uses 32-bit entries; bits 63:32 must be zero.
+    // Verify reply frames are in the first 4 GiB (MPI2 spec requirement)
     if ((fReplyFramePhysBase >> 32) != 0) {
-        LSI_ERR("AllocateDMAPools: reply frame pool above 4 GiB (0x%llx) — "
-                "not supported by MPI2 32-bit free queue entries",
+        LSI_ERR("AllocateDMAPools: reply frame pool above 4 GiB (0x%llx)",
                 fReplyFramePhysBase);
         return kIOReturnNoResources;
     }
 
-    // 2b. Reply free queue ring
-    //
-    // A DMA ring of uint32_t entries, each holding the 32-bit physical
-    // address of one reply frame.  The IOC reads from this ring to find a
-    // free reply frame to write its next reply into.
-    //
-    // This is NOT a register — it is a memory-mapped DMA buffer.
-    // Its physical address goes into IOCInit.ReplyFreeQueueAddress.
+    // 2b. Reply free queue ring (uint32_t array of reply frame PAs)
     ret = allocPool(&fReplyFreeQueueRing,
                     &fReplyFreeRingPhys,
                     reinterpret_cast<void **>(&fReplyFreeRingVirt),
@@ -579,7 +592,7 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
                     "ReplyFreeQueueRing");
     if (ret != kIOReturnSuccess) return ret;
 
-    // 3. Reply post queue (descriptor ring) — must be cache-coherent
+    // 3. Reply post queue (8-byte descriptor ring, IOC → host)
     ret = allocPool(&fReplyPostQueue,
                     &fReplyPostPhysBase,
                     reinterpret_cast<void **>(&fReplyPostVirtBase),
@@ -587,7 +600,7 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
                     "ReplyPostQueue");
     if (ret != kIOReturnSuccess) return ret;
 
-    // Pre-fill the reply post queue with "unused" sentinels
+    // Pre-fill reply post queue with "unused" sentinels
     for (uint32_t i = 0; i < kReplyQueueDepth; i++) {
         fReplyPostVirtBase[i].Words = 0xFFFFFFFFFFFFFFFFULL;
     }
@@ -603,11 +616,10 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
     // 5. Initialise the SMID free-list (SMIDs are 1-based)
     for (uint32_t i = 0; i < kNumRequestFrames; i++) {
         fSMIDFreeList[i] = static_cast<uint16_t>(i + 1);
-
-        // Precompute per-context pointers
-        fCmdCtx[i].requestFrame = &fRequestFrameVirtBase[i];
+        fCmdCtx[i].requestFrame  = &fRequestFrameVirtBase[i];
         fCmdCtx[i].sensePhysAddr = fSensePhysBase + i * kSenseBufferSize;
-        fCmdCtx[i].inUse = false;
+        fCmdCtx[i].completion    = nullptr;
+        fCmdCtx[i].inUse         = false;
     }
     fSMIDFreeHead = 0;
     fSMIDFreeTail = kNumRequestFrames;
@@ -630,33 +642,16 @@ void LSI9300Driver::FreeDMAPools(void)
 }
 
 // ===========================================================================
-// FillReplyFreeQueue — populate the reply free queue DMA ring
+// FillReplyFreeQueue
 // ===========================================================================
-//
-// The reply free queue is a DMA ring of uint32_t physical addresses.  The IOC
-// reads entries from this ring to find a reply frame it can write a reply into.
-//
-// Correct protocol (MPI 2.5 spec, Section 5.4):
-//   1. Write each reply frame's 32-bit PA into the DMA ring slots.
-//   2. After filling N slots, write N to REPLY_FREE_HOST_INDEX_REG to inform
-//      the IOC how many entries are available.
-//
-// This function must be called AFTER AllocateDMAPools (which verifies the
-// frame pool is below 4 GiB) and BEFORE SendIOCInit.
 
 void LSI9300Driver::FillReplyFreeQueue(void)
 {
     for (uint32_t i = 0; i < kNumReplyFrames; i++) {
         uint64_t phys = fReplyFramePhysBase + i * MPT3_REPLY_FRAME_SIZE;
-        // Store the 32-bit PA into the DMA ring (not a register write)
         fReplyFreeRingVirt[i] = static_cast<uint32_t>(phys & 0xFFFFFFFFULL);
     }
-
-    // Flush write ordering: ensure all ring entries are in memory before
-    // we tell the IOC the ring is populated
     OSSynchronizeIO();
-
-    // Inform the IOC that kNumReplyFrames entries are available in the ring
     fReplyFreeIndex = kNumReplyFrames;
     WriteReg32(MPI3_SYSIF_REPLY_FREE_HOST_INDEX_REG, fReplyFreeIndex);
 }
@@ -664,52 +659,30 @@ void LSI9300Driver::FillReplyFreeQueue(void)
 // ===========================================================================
 // SendIOCInit
 // ===========================================================================
-//
-// Sends an IOCInit message via the doorbell handshake to configure the four
-// DMA ring addresses in the firmware:
-//
-//   SystemRequestFrameBaseAddress  — where the host puts SCSI IO requests
-//   ReplyDescriptorPostQueueAddress — where the IOC writes reply descriptors
-//   ReplyFreeQueueAddress           — where the host puts free reply frame PAs
-//   SenseBufferAddressHigh          — upper 32 bits of the sense buffer pool
-//
-// All addresses are populated from the DMA pools allocated by AllocateDMAPools.
 
 kern_return_t LSI9300Driver::SendIOCInit(void)
 {
     MPT3IOCInitRequest req = {};
 
-    // --- Function header ---
     req.Function    = MPI3_FUNCTION_IOC_INIT;
     req.WhoInit     = 0x04U;    // MPI2_WHOINIT_HOST_DRIVER
-    req.MsgVersion  = 0x0200U;  // MPI 2.0 base protocol version
-    req.HostMSIxVectors = 1;    // one MSI-X vector in this release
+    req.MsgVersion  = 0x0200U;
+    req.HostMSIxVectors = 1;
 
-    // --- Request frame pool ---
-    // The IOC validates SMID-indexed request frames against this base address.
     req.SystemRequestFrameBaseAddress =
         fRequestFramePhysBase;
     req.SystemRequestFrameSize =
         static_cast<uint16_t>(MPT3_REQUEST_FRAME_SIZE / sizeof(uint32_t));
 
-    // --- Sense buffer pool ---
-    // Only the upper 32 bits are sent; all sense buffers must share the same
-    // upper 32 bits as the reply frame pool (guaranteed by our 4 GiB assertion).
     req.SenseBufferAddressHigh =
         static_cast<uint32_t>(fSensePhysBase >> 32);
 
-    // --- Reply post queue ring (IOC → host reply descriptors) ---
-    req.ReplyDescriptorPostQueueAddress =
-        fReplyPostPhysBase;
-    req.ReplyDescriptorPostQueueDepth =
+    req.ReplyDescriptorPostQueueAddress = fReplyPostPhysBase;
+    req.ReplyDescriptorPostQueueDepth   =
         static_cast<uint16_t>(kReplyQueueDepth);
 
-    // --- Reply free queue ring (host → IOC free reply frame pool) ---
-    // This points to the DMA ring of uint32_t physical addresses populated
-    // by FillReplyFreeQueue(), NOT to the reply frame pool directly.
-    req.ReplyFreeQueueAddress =
-        fReplyFreeRingPhys;
-    req.ReplyFreeQueueDepth =
+    req.ReplyFreeQueueAddress = fReplyFreeRingPhys;
+    req.ReplyFreeQueueDepth   =
         static_cast<uint16_t>(kNumReplyFrames);
 
     static_assert(sizeof(req) % 4 == 0, "IOCInit must be DWORD-aligned");
@@ -721,16 +694,15 @@ kern_return_t LSI9300Driver::SendIOCInit(void)
                             sizeof(req) / sizeof(uint32_t),
                             reinterpret_cast<uint32_t *>(&reply),
                             replyWords);
-    if (ret != kIOReturnSuccess) {
-        return ret;
-    }
+    if (ret != kIOReturnSuccess) return ret;
+
     if (reply.IOCStatus != MPI3_IOCSTATUS_SUCCESS) {
         LSI_ERR("SendIOCInit: IOCStatus=0x%04x", reply.IOCStatus);
         return kIOReturnDeviceError;
     }
-    LSI_LOG("SendIOCInit: IOC operational — request pool 0x%llx, "
-            "reply post 0x%llx, reply free ring 0x%llx",
-            fRequestFramePhysBase, fReplyPostPhysBase, fReplyFreeRingPhys);
+
+    LSI_LOG("SendIOCInit: IOC operational — reqPool 0x%llx replyPost 0x%llx",
+            fRequestFramePhysBase, fReplyPostPhysBase);
     return kIOReturnSuccess;
 }
 
@@ -742,22 +714,17 @@ kern_return_t LSI9300Driver::EnableEventNotification(void)
 {
     MPT3EventNotificationRequest req = {};
     req.Header.Function = MPI3_FUNCTION_EVENT_NOTIFICATION;
-
-    // Enable all SAS events we care about
     req.EventSwitches[0] =
           (1U << MPI3_EVENT_SAS_DISCOVERY)
         | (1U << MPI3_EVENT_SAS_TOPOLOGY_CHANGE_LIST)
         | (1U << MPI3_EVENT_SAS_DEVICE_STATUS_CHANGE)
         | (1U << MPI3_EVENT_DEVICE_ADDED);
 
-    // Post via high-priority request descriptor
     MPT3HighPriorityRequestDescriptor desc = {};
     desc.DescriptorType = MPI3_REQUEST_DESCRTYPE_HIGH_PRIORITY;
-    desc.SMID = 0; // management messages use SMID 0
+    desc.SMID = 0;
 
-    // The request frame goes into slot 0 of the request pool (reserved for mgmt)
     __builtin_memcpy(fRequestFrameVirtBase, &req, sizeof(req));
-
     PostRequestDescriptor(
         *reinterpret_cast<uint32_t *>(&desc),
         *(reinterpret_cast<uint32_t *>(&desc) + 1));
@@ -771,14 +738,13 @@ kern_return_t LSI9300Driver::EnableEventNotification(void)
 
 kern_return_t LSI9300Driver::SendPortEnable(void)
 {
-    // PortEnable uses a simple management request (function 0x06)
     struct {
         MPT3RequestHeader   Header;
         uint8_t             PhysicalPort;
         uint8_t             Reserved[3];
     } req = {};
-    req.Header.Function  = MPI3_FUNCTION_PORT_ENABLE;
-    req.PhysicalPort     = 0xFF; // all ports
+    req.Header.Function = MPI3_FUNCTION_PORT_ENABLE;
+    req.PhysicalPort    = 0xFF;
 
     __builtin_memcpy(fRequestFrameVirtBase, &req, sizeof(req));
 
@@ -799,9 +765,7 @@ kern_return_t LSI9300Driver::SendPortEnable(void)
 
 uint16_t LSI9300Driver::AllocateSMID(void)
 {
-    if (fSMIDFreeHead == fSMIDFreeTail) {
-        return 0;   // queue is full
-    }
+    if (fSMIDFreeHead == fSMIDFreeTail) return 0;
     uint16_t smid = fSMIDFreeList[fSMIDFreeHead % kNumRequestFrames];
     fSMIDFreeHead++;
     return smid;
@@ -820,163 +784,125 @@ void LSI9300Driver::FreeSMID(uint16_t smid)
 
 void LSI9300Driver::PostRequestDescriptor(uint32_t low, uint32_t high)
 {
-    // The two halves must be written atomically in order (low first)
-    WriteReg32(MPI3_SYSIF_REQUEST_DESCRIPTOR_POST_LOW_REG, low);
+    WriteReg32(MPI3_SYSIF_REQUEST_DESCRIPTOR_POST_LOW_REG,  low);
     WriteReg32(MPI3_SYSIF_REQUEST_DESCRIPTOR_POST_HIGH_REG, high);
 }
 
 void LSI9300Driver::ReturnReplyFrameToFreeQueue(uint64_t replyFramePhys)
 {
-    // Write the 32-bit PA of the consumed reply frame into the next slot
-    // of the reply free queue DMA ring, then advance the producer index.
     fReplyFreeRingVirt[fReplyFreeIndex] =
         static_cast<uint32_t>(replyFramePhys & 0xFFFFFFFFULL);
-
-    // OSSynchronizeIO() before the register write ensures the DMA ring
-    // entry is visible to the IOC before the index register update
     OSSynchronizeIO();
-
     fReplyFreeIndex = (fReplyFreeIndex + 1) % kNumReplyFrames;
     WriteReg32(MPI3_SYSIF_REPLY_FREE_HOST_INDEX_REG, fReplyFreeIndex);
 }
 
 // ===========================================================================
-// BuildSGL — populate the scatter-gather list in a SCSI IO request frame
+// BuildSGL — single-segment SGL using the contiguous DMA address from the
+//            framework (SCSIUserParallelTask.fBufferIOVMAddr)
 // ===========================================================================
 
 kern_return_t LSI9300Driver::BuildSGL(MPT3SCSIIORequest          *req,
-                                      SCSIParallelTaskIdentifier  task)
+                                      const SCSIUserParallelTask &task)
 {
-    // Retrieve the IOMemoryDescriptor from the SCSI task
-    IOMemoryDescriptor *dataDesc = nullptr;
-    GetDataBuffer(task, &dataDesc);
-    if (!dataDesc) {
-        // SCSI command with no data transfer (e.g. TEST UNIT READY)
+    uint64_t dataLen  = task.fRequestedTransferCount;
+    uint64_t dataPhys = task.fBufferIOVMAddr;
+
+    if (dataLen == 0 || dataPhys == 0) {
         req->DataLength = 0;
         return kIOReturnSuccess;
     }
 
-    uint64_t totalLength = dataDesc->GetLength();
-    if (totalLength == 0) {
-        req->DataLength = 0;
-        return kIOReturnSuccess;
-    }
+    req->DataLength = static_cast<uint32_t>(dataLen);
 
-    req->DataLength = static_cast<uint32_t>(totalLength);
-
-    // Enumerate physical segments
-    IODMACommandSpecification spec = {
-        .options        = kIODMACommandSpecificationNoOptions,
-        .maxAddressBits = 64,
-    };
-    IODMACommand *dmaCmd = nullptr;
-    kern_return_t ret = IODMACommand::Create(fPCIDevice, 0, &spec, &dmaCmd);
-    if (ret != kIOReturnSuccess) return ret;
-
-    uint64_t offset = 0;
-    uint32_t sglIdx = 0;
-
-    while (offset < totalLength && sglIdx < MPT3_MAX_SGL_ENTRIES_IN_FRAME) {
-        uint64_t segPhys  = 0;
-        uint64_t segBytes = 0;
-
-        ret = dmaCmd->GetPhysicalSegment(dataDesc, offset, &segPhys, &segBytes, 0);
-        if (ret != kIOReturnSuccess) break;
-
-        uint32_t flags = MPI3_SGE_FLAGS_SIMPLE_ELEMENT
-                       | MPI3_SGE_FLAGS_64_BIT_ADDRESSING;
-
-        // Mark data direction
-        uint8_t dir = GetDataTransferDirection(task);
-        if (dir == kSCSIDataTransfer_FromInitiatorToTarget) {
-            flags |= MPI3_SGE_FLAGS_HOST_TO_IOC;
-        }
-
-        // Last segment
-        if (offset + segBytes >= totalLength) {
-            flags |= MPI3_SGE_FLAGS_LAST_ELEMENT
+    // Build a single simple SGL entry.
+    // The DriverKit framework guarantees one contiguous physical segment.
+    uint32_t flags = MPI3_SGE_FLAGS_SIMPLE_ELEMENT
+                   | MPI3_SGE_FLAGS_64_BIT_ADDRESSING
+                   | MPI3_SGE_FLAGS_LAST_ELEMENT
                    | MPI3_SGE_FLAGS_END_OF_BUFFER
                    | MPI3_SGE_FLAGS_END_OF_LIST;
-        }
 
-        // Flags occupy bits 31:24; length in bits 23:0
-        req->SGL[sglIdx].FlagsLength = flags
-                                     | (static_cast<uint32_t>(segBytes) & MPI3_SGE_LENGTH_MASK);
-        req->SGL[sglIdx].DataBufferLow  = static_cast<uint32_t>(segPhys & 0xFFFFFFFFULL);
-        req->SGL[sglIdx].DataBufferHigh = static_cast<uint32_t>(segPhys >> 32);
-
-        offset  += segBytes;
-        sglIdx++;
+    // kSCSIDataTransfer_FromInitiatorToTarget == write (host → device)
+    if (task.fTransferDirection == kSCSIDataTransfer_FromInitiatorToTarget) {
+        flags |= MPI3_SGE_FLAGS_HOST_TO_IOC;
     }
 
-    dmaCmd->release();
-
-    if (offset < totalLength) {
-        LSI_ERR("BuildSGL: transfer too large for inline SGL (%llu bytes)", totalLength);
-        // TODO: implement chain SGL for large I/Os
-        return kIOReturnNoResources;
-    }
+    req->SGL[0].FlagsLength   = flags
+                              | (static_cast<uint32_t>(dataLen) & MPI3_SGE_LENGTH_MASK);
+    req->SGL[0].DataBufferLow  = static_cast<uint32_t>(dataPhys & 0xFFFFFFFFULL);
+    req->SGL[0].DataBufferHigh = static_cast<uint32_t>(dataPhys >> 32);
 
     return kIOReturnSuccess;
 }
 
 // ===========================================================================
-// ProcessParallelTask — main I/O submission path
+// UserProcessParallelTask — main I/O submission path
 // ===========================================================================
 
-SCSIServiceResponse LSI9300Driver::ProcessParallelTask(
-                                       SCSIParallelTaskIdentifier parallelRequest)
+kern_return_t IMPL(LSI9300Driver, UserProcessParallelTask)(
+    SCSIUserParallelTask  parallelRequest,
+    uint32_t             *response,
+    OSAction             *completion)
 {
+    *response = kSCSIServiceResponse_Request_In_Process;
+
     if (!fControllerOnline) {
-        return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        return kIOReturnOffline;
     }
 
-    // Allocate an SMID slot
     uint16_t smid = AllocateSMID();
     if (smid == 0) {
-        LSI_ERR("ProcessParallelTask: no free SMID slots");
-        return kSCSIServiceResponse_TASK_SET_FULL;
+        LSI_ERR("UserProcessParallelTask: no free SMID slots");
+        *response = kSCSIServiceResponse_TASK_SET_FULL;
+        return kIOReturnBusy;
     }
 
     MPT3CommandContext &ctx = fCmdCtx[smid - 1];
-    ctx.task  = parallelRequest;
+    ctx.controllerTaskID = parallelRequest.fControllerTaskIdentifier;
+    ctx.targetID         = static_cast<SCSITargetIdentifier>(parallelRequest.fTargetID);
+    ctx.completion       = completion;
+    ctx.completion->retain();   // retained until CompleteScsiIO releases it
     ctx.inUse = true;
 
     MPT3SCSIIORequest *req = ctx.requestFrame;
     __builtin_memset(req, 0, sizeof(*req));
 
-    // Fill header
+    // Fill request header
     req->Header.Function = MPI3_FUNCTION_SCSI_IO;
+    req->DevHandle       = static_cast<uint16_t>(parallelRequest.fTargetID);
 
-    // Target device handle is stored in the SCSITargetIdentifier
-    SCSITargetIdentifier targetID = GetTargetIdentifier(parallelRequest);
-    req->DevHandle = static_cast<uint16_t>(targetID);
-
-    // CDB
-    SCSICommandDescriptorBlock cdb = {};
-    UInt8 cdbLen = 0;
-    GetCommandDescriptorBlock(parallelRequest, &cdb);
-    cdbLen = GetCommandDescriptorBlockSize(parallelRequest);
-    __builtin_memcpy(req->CDB, cdb, cdbLen);
+    // CDB (fCommandDescriptorBlock is SCSICommandDescriptorBlock = uint8_t[16])
+    static_assert(sizeof(parallelRequest.fCommandDescriptorBlock) <= sizeof(req->CDB),
+                  "CDB field size mismatch");
+    __builtin_memcpy(req->CDB,
+                     parallelRequest.fCommandDescriptorBlock,
+                     parallelRequest.fCommandSize);
 
     // Sense buffer (pre-allocated per SMID)
     req->SenseBufferLowAddress = static_cast<uint32_t>(ctx.sensePhysAddr & 0xFFFFFFFFULL);
     req->SenseBufferLength     = kSenseBufferSize;
 
-    // Task attributes
-    uint8_t attr = GetTaskAttribute(parallelRequest);
-    req->TaskAttributes = attr;
+    // Task attribute (simple, ordered, ACA, HoQ)
+    req->TaskAttributes = static_cast<uint8_t>(parallelRequest.fTaskAttribute);
 
-    // Scatter-gather
+    // SGL — single contiguous segment from the framework-prepared DMA buffer
     req->SGLOffset0 = offsetof(MPT3SCSIIORequest, SGL) / sizeof(uint32_t);
     kern_return_t sglRet = BuildSGL(req, parallelRequest);
     if (sglRet != kIOReturnSuccess) {
-        FreeSMID(smid);
+        OSSafeReleaseNULL(ctx.completion);
         ctx.inUse = false;
-        return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        FreeSMID(smid);
+        *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        return sglRet;
     }
 
-    // Build and post the request descriptor
+    // DMA barrier: ensure request frame data is written to memory before
+    // the descriptor is posted to the controller via MMIO.
+    OSSynchronizeIO();
+
+    // Build and post the SCSI IO request descriptor
     MPT3SCSIIORequestDescriptor desc = {};
     desc.DescriptorType = MPI3_REQUEST_DESCRTYPE_SCSI_IO;
     desc.MSIxIndex      = 0;
@@ -987,7 +913,7 @@ SCSIServiceResponse LSI9300Driver::ProcessParallelTask(
         *reinterpret_cast<uint32_t *>(&desc),
         *(reinterpret_cast<uint32_t *>(&desc) + 1));
 
-    return kSCSIServiceResponse_Request_In_Process;
+    return kIOReturnSuccess;
 }
 
 // ===========================================================================
@@ -1000,29 +926,23 @@ void LSI9300Driver::HandleInterrupt(IOInterruptDispatchSource * /*source*/,
     uint32_t status = ReadReg32(MPI3_SYSIF_HOST_INT_STATUS_REG);
 
     if (!(status & MPI3_SYSIF_HOST_INT_STATUS_REPLY_DESCRIPTOR_INT)) {
-        return; // Spurious interrupt
+        return;  // spurious interrupt
     }
 
-    // Acknowledge the interrupt
     WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                MPI3_SYSIF_HOST_INT_STATUS_REPLY_DESCRIPTOR_INT);
 
-    // Drain the reply post queue
     for (;;) {
         MPT3ReplyDescriptor &desc = fReplyPostVirtBase[fReplyPostIndex];
 
-        // An all-ones descriptor means the slot is empty
-        if (desc.Words == 0xFFFFFFFFFFFFFFFFULL) {
-            break;
-        }
+        if (desc.Words == 0xFFFFFFFFFFFFFFFFULL) break;
 
         uint8_t descType = desc.AddressReply.DescriptorType;
 
         if (descType == MPI3_REPLY_DESCRTYPE_ADDRESS_REPLY) {
-            // A full reply frame was written — locate and process it
             uint64_t replyPhys =
                 static_cast<uint64_t>(desc.AddressReply.ReplyFrameAddress) << 4;
-            uint64_t offset    = replyPhys - fReplyFramePhysBase;
+            uint64_t offset = replyPhys - fReplyFramePhysBase;
             if (offset < kNumReplyFrames * MPT3_REPLY_FRAME_SIZE) {
                 const MPT3ReplyHeader *hdr =
                     reinterpret_cast<MPT3ReplyHeader *>(fReplyFrameVirtBase + offset);
@@ -1045,16 +965,12 @@ void LSI9300Driver::HandleInterrupt(IOInterruptDispatchSource * /*source*/,
                                   hdr->Function);
                         break;
                 }
-                // Return the reply frame to the IOC's free pool
                 ReturnReplyFrameToFreeQueue(replyPhys);
             }
         }
 
-        // Mark the descriptor as consumed and advance the consumer index
         desc.Words = 0xFFFFFFFFFFFFFFFFULL;
         fReplyPostIndex = (fReplyPostIndex + 1) % kReplyQueueDepth;
-
-        // Update the reply post host index register
         WriteReg32(MPI3_SYSIF_REPLY_POST_HOST_INDEX_REG, fReplyPostIndex);
     }
 }
@@ -1071,53 +987,55 @@ void LSI9300Driver::CompleteScsiIO(const MPT3SCSIIOReply *reply, uint16_t smid)
     }
 
     MPT3CommandContext &ctx = fCmdCtx[smid - 1];
-    if (!ctx.inUse || !ctx.task) {
+    if (!ctx.inUse || !ctx.completion) {
         LSI_ERR("CompleteScsiIO: SMID %u not in use", smid);
         return;
     }
 
-    SCSIParallelTaskIdentifier task = ctx.task;
-
-    // Map MPT3 IOC status → SCSI service response
-    SCSIServiceResponse  serviceResponse = kSCSIServiceResponse_TASK_COMPLETE;
-    SCSITaskStatus       taskStatus      = kSCSITaskStatus_GOOD;
+    // Build the DriverKit parallel response struct
+    SCSIUserParallelResponse resp = {};
+    resp.version                    = kScsiUserParallelTaskCurrentVersion1;
+    resp.fControllerTaskIdentifier  = ctx.controllerTaskID;
+    resp.fTargetID                  = static_cast<uint64_t>(ctx.targetID);
 
     if (reply->Header.IOCStatus != MPI3_IOCSTATUS_SUCCESS &&
         reply->Header.IOCStatus != MPI3_IOCSTATUS_SCSI_DATA_UNDERRUN) {
-        serviceResponse = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
-        taskStatus      = kSCSITaskStatus_No_Status;
+        // Hardware-level failure
+        resp.fServiceResponse  = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        resp.fCompletionStatus = kSCSITaskStatus_No_Status;
         LSI_ERR("CompleteScsiIO: SMID %u IOCStatus=0x%04x",
                 smid, reply->Header.IOCStatus);
     } else {
-        // Propagate the SCSI status byte from the device
-        taskStatus = static_cast<SCSITaskStatus>(reply->SCSIStatus);
+        resp.fServiceResponse  = kSCSIServiceResponse_TASK_COMPLETE;
+        resp.fCompletionStatus = static_cast<SCSITaskStatus>(reply->SCSIStatus);
+        resp.fBytesTransferred = reply->TransferCount;
 
         // Copy autosense data if valid
         if (reply->SCSIState & MPI3_SCSI_STATE_AUTOSENSE_VALID) {
-            uint32_t senseLen = MIN(reply->SenseCount, kSenseBufferSize);
             uint8_t *senseData = fSenseVirtBase + (smid - 1) * kSenseBufferSize;
-            SetAutoSenseData(task, senseData, static_cast<UInt8>(senseLen));
+            uint8_t  senseLen  = static_cast<uint8_t>(
+                                    reply->SenseCount < sizeof(resp.fSenseBuffer)
+                                    ? reply->SenseCount
+                                    : sizeof(resp.fSenseBuffer));
+            __builtin_memcpy(resp.fSenseBuffer, senseData, senseLen);
+            resp.fSenseLength = senseLen;
         }
 
-        // Report residual
         if (reply->Header.IOCStatus == MPI3_IOCSTATUS_SCSI_DATA_UNDERRUN) {
-            uint64_t requested  = GetRequestedDataTransferCount(task);
-            uint64_t actual     = reply->TransferCount;
-            SetRealizedDataTransferCount(task, actual);
-            LSI_DEBUG("CompleteScsiIO: underrun SMID=%u req=%llu act=%llu",
-                      smid, requested, actual);
-        } else {
-            SetRealizedDataTransferCount(task, reply->TransferCount);
+            LSI_DEBUG("CompleteScsiIO: underrun SMID=%u actual=%u",
+                      smid, reply->TransferCount);
         }
     }
 
-    // Release the SMID before calling CompleteParallelTask (it may re-queue)
-    ctx.inUse = false;
-    ctx.task  = nullptr;
+    // Release the SMID before the completion callback (it may re-queue)
+    OSAction *completion = ctx.completion;
+    ctx.completion = nullptr;
+    ctx.inUse      = false;
     FreeSMID(smid);
 
-    // Notify the SCSI stack
-    CompleteParallelTask(task, serviceResponse, taskStatus);
+    // Invoke the framework completion callback
+    ParallelTaskCompletion(completion, resp);
+    completion->release();
 }
 
 // ===========================================================================
@@ -1132,8 +1050,6 @@ void LSI9300Driver::HandleEventNotification(const MPT3EventNotificationReply *ev
             break;
         case MPI3_EVENT_DEVICE_ADDED:
             LSI_LOG("Event: SAS/SATA device added");
-            // The storage stack is notified via the standard target creation
-            // callback path; no extra action needed here.
             break;
         case MPI3_EVENT_SAS_DEVICE_STATUS_CHANGE:
             LSI_LOG("Event: SAS device status changed");
@@ -1146,7 +1062,6 @@ void LSI9300Driver::HandleEventNotification(const MPT3EventNotificationReply *ev
             break;
     }
 
-    // The IOC requires an event ACK for certain events
     if (event->AckRequired) {
         struct {
             MPT3RequestHeader Header;
@@ -1167,22 +1082,23 @@ void LSI9300Driver::HandleEventNotification(const MPT3EventNotificationReply *ev
 }
 
 // ===========================================================================
-// AbortTask — TMF ABORT_TASK
+// Task management
 // ===========================================================================
 
-SCSIServiceResponse LSI9300Driver::AbortTask(
-    SCSITargetIdentifier   targetID,
-    SCSILogicalUnitNumber  lun,
-    SCSITaggedTaskIdentifier taggedTaskID)
+kern_return_t IMPL(LSI9300Driver, UserAbortTaskRequest)(
+    uint64_t  theT,
+    uint64_t  theL,
+    uint64_t  theQ,
+    uint32_t *response)
 {
-    LSI_LOG("AbortTask: target=%llu lun=%llu tag=%llu",
-            (uint64_t)targetID, (uint64_t)lun, (uint64_t)taggedTaskID);
+    LSI_LOG("UserAbortTaskRequest: target=%llu lun=%llu tag=%llu",
+            theT, theL, theQ);
 
     MPT3SCTMRequest req = {};
     req.Header.Function = MPI3_FUNCTION_SCSI_TASK_MGMT;
-    req.DevHandle       = static_cast<uint16_t>(targetID);
+    req.DevHandle       = static_cast<uint16_t>(theT);
     req.TaskType        = MPI3_SCSITASKMGMT_TASKTYPE_ABORT_TASK;
-    req.TaskMID         = static_cast<uint16_t>(taggedTaskID);
+    req.TaskMID         = static_cast<uint16_t>(theQ);
 
     __builtin_memcpy(fRequestFrameVirtBase, &req, sizeof(req));
 
@@ -1194,22 +1110,20 @@ SCSIServiceResponse LSI9300Driver::AbortTask(
         *reinterpret_cast<uint32_t *>(&desc),
         *(reinterpret_cast<uint32_t *>(&desc) + 1));
 
-    return kSCSIServiceResponse_Request_In_Process;
+    *response = kSCSIServiceResponse_Request_In_Process;
+    return kIOReturnSuccess;
 }
 
-// ===========================================================================
-// AbortTaskSet — TMF TARGET_RESET
-// ===========================================================================
-
-SCSIServiceResponse LSI9300Driver::AbortTaskSet(
-    SCSITargetIdentifier  targetID,
-    SCSILogicalUnitNumber lun)
+kern_return_t IMPL(LSI9300Driver, UserAbortTaskSetRequest)(
+    uint64_t  theT,
+    uint64_t  theL,
+    uint32_t *response)
 {
-    LSI_LOG("AbortTaskSet / TargetReset: target=%llu", (uint64_t)targetID);
+    LSI_LOG("UserAbortTaskSetRequest / TargetReset: target=%llu", theT);
 
     MPT3SCTMRequest req = {};
     req.Header.Function = MPI3_FUNCTION_SCSI_TASK_MGMT;
-    req.DevHandle       = static_cast<uint16_t>(targetID);
+    req.DevHandle       = static_cast<uint16_t>(theT);
     req.TaskType        = MPI3_SCSITASKMGMT_TASKTYPE_TARGET_RESET;
 
     __builtin_memcpy(fRequestFrameVirtBase, &req, sizeof(req));
@@ -1222,59 +1136,92 @@ SCSIServiceResponse LSI9300Driver::AbortTaskSet(
         *reinterpret_cast<uint32_t *>(&desc),
         *(reinterpret_cast<uint32_t *>(&desc) + 1));
 
-    return kSCSIServiceResponse_Request_In_Process;
+    *response = kSCSIServiceResponse_Request_In_Process;
+    return kIOReturnSuccess;
 }
 
 // ===========================================================================
-// IOUserSCSIParallelInterfaceController capability reports
+// Capability report overrides
 // ===========================================================================
 
-bool LSI9300Driver::InitializeController(void)
+kern_return_t IMPL(LSI9300Driver, UserMapHBAData)(uint32_t *uniqueTaskID)
 {
-    LSI_LOG("InitializeController");
-    return fControllerOnline;
+    // SMID allocation is handled inside UserProcessParallelTask.
+    // Report 0 here; the framework uses the returned uniqueTaskID for its
+    // own per-task data tracking, which we do not need to override.
+    *uniqueTaskID = 0;
+    return kIOReturnSuccess;
 }
 
-void LSI9300Driver::TerminateController(void)
+kern_return_t IMPL(LSI9300Driver, UserDoesHBAPerformAutoSense)(bool *result)
 {
-    LSI_LOG("TerminateController");
-    fControllerOnline = false;
+    // The SAS3008 always writes autosense data to the pre-allocated sense
+    // buffer pointed to by SenseBufferLowAddress in the request frame.
+    *result = true;
+    return kIOReturnSuccess;
 }
 
-uint32_t LSI9300Driver::ReportHBASpecificDeviceData(void)
+kern_return_t IMPL(LSI9300Driver, UserDoesHBAPerformDeviceManagement)(bool *result)
 {
-    return 0;
+    // We do not perform device management; the storage stack does it.
+    *result = false;
+    return kIOReturnSuccess;
 }
 
-uint32_t LSI9300Driver::ReportMaximumTaskCount(void)
+kern_return_t IMPL(LSI9300Driver, UserReportMaximumTaskCount)(uint32_t *count)
 {
-    return static_cast<uint32_t>(fIOCFacts.RequestCredit)
-           ? fIOCFacts.RequestCredit
-           : kNumRequestFrames;
+    *count = fIOCFacts.RequestCredit ? fIOCFacts.RequestCredit : kNumRequestFrames;
+    return kIOReturnSuccess;
 }
 
-uint32_t LSI9300Driver::ReportMaxSupportedTaskCount(void)
+kern_return_t IMPL(LSI9300Driver, UserReportHighestSupportedDeviceID)(uint64_t *id)
 {
-    return kNumRequestFrames;
+    *id = fIOCFacts.IOCMaxDevices ? fIOCFacts.IOCMaxDevices - 1 : 255;
+    return kIOReturnSuccess;
 }
 
-void LSI9300Driver::ReportHBAConstraints(
-    IOMapper             *mapper,
-    SCSIDeviceIdentifier *maxDeviceID,
-    SCSILogicalUnitNumber *maxLUN,
-    uint32_t             *maxIOSize,
-    uint32_t             *maxSegmentCount,
-    uint64_t             *maxSegmentSize,
-    uint64_t             *maxAddressableSegment,
-    uint32_t             *alignmentMask)
+kern_return_t IMPL(LSI9300Driver, UserReportInitiatorIdentifier)(uint64_t *id)
 {
-    (void)mapper;
-    *maxDeviceID            = static_cast<SCSIDeviceIdentifier>(
-                                  fIOCFacts.IOCMaxDevices ? fIOCFacts.IOCMaxDevices - 1 : 255);
-    *maxLUN                 = 255;
-    *maxIOSize              = 1024U * 1024U; // 1 MiB
-    *maxSegmentCount        = kMaxSGSegments;
-    *maxSegmentSize         = 0x0000000100000000ULL; // 4 GiB per segment
-    *maxAddressableSegment  = 0xFFFFFFFFFFFFFFFFULL; // 64-bit capable
-    *alignmentMask          = 0x3U;                  // 4-byte alignment
+    *id = 7;   // default SAS initiator ID
+    return kIOReturnSuccess;
+}
+
+kern_return_t IMPL(LSI9300Driver, UserReportHBAHighestLogicalUnitNumber)(uint64_t *value)
+{
+    *value = 255;
+    return kIOReturnSuccess;
+}
+
+kern_return_t IMPL(LSI9300Driver, UserReportHBAConstraints)(OSDictionary *constraints)
+{
+    // Set DMA constraints via key/value pairs in the provided dictionary.
+    // kIOMaximumSegmentCountReadKey etc. are defined in DriverKit/IODMACommand.h
+    auto setNum = [&](const char *key, uint64_t val) {
+        OSNumber *n = OSNumber::withNumber(val, 64);
+        if (n) {
+            constraints->setObject(key, n);
+            n->release();
+        }
+    };
+
+    setNum(kIOMaximumSegmentAddressableBitCountKey, 64);  // full 64-bit DMA
+    setNum(kIOMaximumSegmentCountReadKey,  kMaxSGSegments);
+    setNum(kIOMaximumSegmentCountWriteKey, kMaxSGSegments);
+    setNum(kIOMaximumByteCountReadKey,  1ULL * 1024 * 1024);  // 1 MiB max
+    setNum(kIOMaximumByteCountWriteKey, 1ULL * 1024 * 1024);
+
+    return kIOReturnSuccess;
+}
+
+kern_return_t IMPL(LSI9300Driver, UserGetDMASpecification)(
+    uint64_t             *maxTransferSize,
+    uint32_t             *alignment,
+    uint8_t              *numAddressBits,
+    DMAOutputSegmentType *segmentType)
+{
+    *maxTransferSize = 1ULL * 1024 * 1024;  // 1 MiB — hardware limit
+    *alignment       = 4;                    // 4-byte alignment
+    *numAddressBits  = 64;
+    *segmentType     = kIODMACommandOutputSegments64;
+    return kIOReturnSuccess;
 }

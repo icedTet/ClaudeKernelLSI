@@ -46,13 +46,16 @@ void MPT3IOCManager::Attach(volatile uint8_t *bar1Base)
 
 uint32_t MPT3IOCManager::ReadReg32(uint32_t offset) const
 {
-    return OSReadLittleInt32(fBarBase, offset);
+    // OSReadLittleInt32 is kernel-only.  In DriverKit we use a direct volatile
+    // read.  ARM64 is natively little-endian so no byte-swap is needed.
+    return *(volatile uint32_t *)(fBarBase + offset);
 }
 
 void MPT3IOCManager::WriteReg32(uint32_t offset, uint32_t value)
 {
-    OSWriteLittleInt32(fBarBase, offset, value);
-    OSSynchronizeIO();
+    // OSWriteLittleInt32 is kernel-only.  Direct volatile write + IO barrier.
+    *(volatile uint32_t *)(fBarBase + offset) = value;
+    OSSynchronizeIO();   // dmb oshst — ensures store visible to device
 }
 
 // ===========================================================================

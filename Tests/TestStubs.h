@@ -16,9 +16,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 
 // ---------------------------------------------------------------------------
-// Stub out DriverKit types / macros used in the headers
+// Basic DriverKit types
 // ---------------------------------------------------------------------------
 
 typedef int kern_return_t;
@@ -33,48 +34,133 @@ typedef int kern_return_t;
 #define kIOReturnNotReady       (-8)
 #define kIOReturnDeviceError    (-9)
 #define kIOReturnBusy           (-10)
+#define kIOReturnOffline        (-11)
 
-// SCSIServiceResponse stubs
-typedef int SCSIServiceResponse;
-#define kSCSIServiceResponse_Request_In_Process         0
-#define kSCSIServiceResponse_TASK_COMPLETE              1
-#define kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE 2
-#define kSCSIServiceResponse_TASK_SET_FULL              3
-
-typedef int SCSITaskStatus;
-#define kSCSITaskStatus_GOOD                            0
-#define kSCSITaskStatus_No_Status                       1
-#define kSCSITaskStatus_DeliveryFailure                 2
+// ---------------------------------------------------------------------------
+// SCSI types
+// ---------------------------------------------------------------------------
 
 typedef uint64_t SCSITargetIdentifier;
 typedef uint64_t SCSILogicalUnitNumber;
 typedef uint64_t SCSITaggedTaskIdentifier;
 typedef uint64_t SCSIDeviceIdentifier;
-typedef uint64_t SCSIParallelTaskIdentifier;
 typedef uint8_t  SCSICommandDescriptorBlock[16];
+typedef uint8_t  SCSITaskStatus;
+typedef uint8_t  SCSIServiceResponse;
+typedef uint8_t  SCSITaskAttribute;
 
-typedef int SCSIParallelFeature;
+#define kSCSIServiceResponse_Request_In_Process         0
+#define kSCSIServiceResponse_TASK_COMPLETE              1
+#define kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE 2
+#define kSCSIServiceResponse_TASK_SET_FULL              3
 
-// Stub DriverKit IOService
-class IOService {
+#define kSCSITaskStatus_GOOD                            0
+#define kSCSITaskStatus_No_Status                       1
+#define kSCSITaskStatus_DeliveryFailure                 2
+#define kSCSITaskStatus_CHECK_CONDITION                 2
+
+#define kSCSIDataTransfer_NoDataTransfer                0
+#define kSCSIDataTransfer_FromTargetToInitiator         1
+#define kSCSIDataTransfer_FromInitiatorToTarget         2
+
+#define kSCSITask_SIMPLE        0
+#define kSCSITask_ORDERED       1
+#define kSCSITask_HEAD_OF_QUEUE 2
+#define kSCSITask_ACA           3
+
+// SCSIUserParallelTaskVersion enum
+typedef uint64_t SCSIUserParallelTaskVersion;
+#define kScsiUserParallelTaskCurrentVersion1  ((SCSIUserParallelTaskVersion)1)
+
+// ---------------------------------------------------------------------------
+// SCSIUserParallelTask — the struct the framework passes to UserProcessParallelTask
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint64_t                    version;
+    uint64_t                    fControllerTaskIdentifier;
+    uint64_t                    fTargetID;
+    uint8_t                     fLogicalUnitBytes[8];
+    SCSICommandDescriptorBlock  fCommandDescriptorBlock;
+    uint8_t                     fCommandSize;
+    uint8_t                     fTransferDirection;
+    uint8_t                     fTaskAttribute;
+    uint8_t                     _pad1;
+    uint32_t                    _pad2;
+    uint64_t                    fRequestedTransferCount;
+    uint64_t                    fBufferIOVMAddr;
+    uint64_t                    fTaskTagIdentifier;
+    uint32_t                    fTimeoutInMilliSec;
+    uint8_t                     reserved[20];
+} SCSIUserParallelTask;
+
+// ---------------------------------------------------------------------------
+// SCSIUserParallelResponse — passed back via ParallelTaskCompletion
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint64_t            version;
+    uint64_t            fControllerTaskIdentifier;
+    uint64_t            fTargetID;
+    SCSIServiceResponse fServiceResponse;
+    SCSITaskStatus      fCompletionStatus;
+    uint8_t             fSenseLength;
+    uint8_t             _pad1;
+    uint32_t            _pad2;
+    uint64_t            fBytesTransferred;
+    uint8_t             fSenseBuffer[256];
+    uint8_t             reserved[16];
+} SCSIUserParallelResponse;
+
+// ---------------------------------------------------------------------------
+// DMA output segment type
+// ---------------------------------------------------------------------------
+
+typedef uint32_t DMAOutputSegmentType;
+#define kIODMACommandOutputSegments64   2
+
+// ---------------------------------------------------------------------------
+// DriverKit object stubs
+// ---------------------------------------------------------------------------
+
+class OSObject {
 public:
-    virtual kern_return_t Start(IOService *) { return kIOReturnSuccess; }
-    virtual kern_return_t Stop(IOService *)  { return kIOReturnSuccess; }
     virtual void retain()  {}
     virtual void release() {}
 };
 
-// Stub IOMapper
-class IOMapper {};
+class OSAction : public OSObject {};
 
-// Stub IOMemoryDescriptor
-class IOMemoryDescriptor {
+class OSDictionary : public OSObject {
 public:
-    virtual uint64_t GetLength() { return 0; }
-    virtual void     release()   {}
+    static OSDictionary *withCapacity(uint32_t) { return nullptr; }
+    bool setObject(const char *, OSObject *) { return true; }
 };
 
-// Stub IOBufferMemoryDescriptor
+class OSNumber : public OSObject {
+public:
+    static OSNumber *withNumber(uint64_t, uint32_t) { return new OSNumber(); }
+};
+
+// ---------------------------------------------------------------------------
+// IOService stubs
+// ---------------------------------------------------------------------------
+
+class IOService : public OSObject {
+public:
+    virtual kern_return_t Start(IOService *, ...) { return kIOReturnSuccess; }
+    virtual kern_return_t Stop(IOService *, ...)  { return kIOReturnSuccess; }
+};
+
+// ---------------------------------------------------------------------------
+// DriverKit hardware / DMA stubs
+// ---------------------------------------------------------------------------
+
+class IOMemoryDescriptor : public OSObject {
+public:
+    virtual uint64_t GetLength() { return 0; }
+};
+
 class IOBufferMemoryDescriptor : public IOMemoryDescriptor {
 public:
     static kern_return_t Create(int, size_t, int, IOBufferMemoryDescriptor **out) {
@@ -83,16 +169,13 @@ public:
     kern_return_t Map(int, int, int, int, uint64_t *) { return kIOReturnSuccess; }
 };
 
-// Stub IOMemoryMap
-class IOMemoryMap {
+class IOMemoryMap : public OSObject {
 public:
     uint64_t GetAddress() { return 0; }
     uint64_t GetLength()  { return 0; }
-    void     release()    {}
 };
 
-// Stub IOInterruptDispatchSource
-class IOInterruptDispatchSource {
+class IOInterruptDispatchSource : public OSObject {
 public:
     typedef void *ActionBlock;
     static kern_return_t Create(void *, uint32_t, void *, IOInterruptDispatchSource **out) {
@@ -101,17 +184,15 @@ public:
     kern_return_t SetHandler(void *, void *) { return kIOReturnSuccess; }
     kern_return_t Activate()                 { return kIOReturnSuccess; }
     kern_return_t Cancel()                   { return kIOReturnSuccess; }
-    void release() {}
 };
 
-// Stub IODMACommand
 struct IODMACommandSpecification {
     int options;
     int maxAddressBits;
 };
 #define kIODMACommandSpecificationNoOptions 0
 
-class IODMACommand {
+class IODMACommand : public OSObject {
 public:
     static kern_return_t Create(void *, int, IODMACommandSpecification *, IODMACommand **out) {
         *out = nullptr; return kIOReturnSuccess;
@@ -119,13 +200,8 @@ public:
     kern_return_t Prepare(void *, uint64_t, uint64_t, bool, uint64_t *, void *) {
         return kIOReturnSuccess;
     }
-    kern_return_t GetPhysicalSegment(void *, uint64_t, uint64_t *, uint64_t *, int) {
-        return kIOReturnError;
-    }
-    void release() {}
 };
 
-// Stub IOPCIDevice
 class IOPCIDevice : public IOService {
 public:
     kern_return_t Open(void *, int)  { return kIOReturnSuccess; }
@@ -134,85 +210,130 @@ public:
         *out = nullptr; return kIOReturnSuccess;
     }
     kern_return_t ConfigurationRead16(int, uint16_t *out) {
-        *out = 0; return kIOReturnSuccess;
+        if (out) *out = 0; return kIOReturnSuccess;
     }
     kern_return_t ConfigurationWrite16(int, uint16_t) { return kIOReturnSuccess; }
 };
 
-// Stub IOUserSCSIParallelInterfaceController
+// ---------------------------------------------------------------------------
+// IOUserSCSIParallelInterfaceController stub
+// Mirrors the actual DriverKit API with User-prefixed methods.
+// ---------------------------------------------------------------------------
+
 class IOUserSCSIParallelInterfaceController : public IOService {
 public:
-    virtual kern_return_t Start(IOService *p)  { return IOService::Start(p); }
-    virtual kern_return_t Stop(IOService *p)   { return IOService::Stop(p); }
+    virtual kern_return_t Start(IOService *p, ...)  { return kIOReturnSuccess; }
+    virtual kern_return_t Stop(IOService *p, ...)   { return kIOReturnSuccess; }
 
-    virtual bool           InitializeController() { return true; }
-    virtual void           TerminateController()  {}
-    virtual uint32_t       ReportHBASpecificDeviceData()  { return 0; }
-    virtual uint32_t       ReportMaximumTaskCount()       { return 512; }
-    virtual uint32_t       ReportMaxSupportedTaskCount()  { return 512; }
-
-    virtual SCSIServiceResponse ProcessParallelTask(SCSIParallelTaskIdentifier)
-        { return kSCSIServiceResponse_Request_In_Process; }
-
-    virtual SCSIServiceResponse AbortTask(SCSITargetIdentifier, SCSILogicalUnitNumber,
-                                          SCSITaggedTaskIdentifier)
-        { return kSCSIServiceResponse_Request_In_Process; }
-
-    virtual SCSIServiceResponse AbortTaskSet(SCSITargetIdentifier, SCSILogicalUnitNumber)
-        { return kSCSIServiceResponse_Request_In_Process; }
-
-    virtual void ReportHBAConstraints(IOMapper *, SCSIDeviceIdentifier *, SCSILogicalUnitNumber *,
-                                      uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint32_t *) {}
-
-    // Helpers the driver calls
-    SCSITargetIdentifier   GetTargetIdentifier(SCSIParallelTaskIdentifier) { return 0; }
-    void                   GetCommandDescriptorBlock(SCSIParallelTaskIdentifier,
-                                                     SCSICommandDescriptorBlock *) {}
-    uint8_t                GetCommandDescriptorBlockSize(SCSIParallelTaskIdentifier) { return 6; }
-    uint8_t                GetTaskAttribute(SCSIParallelTaskIdentifier) { return 0; }
-    uint8_t                GetDataTransferDirection(SCSIParallelTaskIdentifier) { return 0; }
-    void                   GetDataBuffer(SCSIParallelTaskIdentifier, IOMemoryDescriptor **out) {
-        if (out) *out = nullptr;
+    // Pure virtual overrides the subclass must implement
+    virtual kern_return_t UserInitializeController() { return kIOReturnSuccess; }
+    virtual kern_return_t UserStartController()      { return kIOReturnSuccess; }
+    virtual kern_return_t UserProcessParallelTask(
+        SCSIUserParallelTask, uint32_t *, OSAction *) { return kIOReturnSuccess; }
+    virtual kern_return_t UserMapHBAData(uint32_t *id) {
+        if (id) *id = 0; return kIOReturnSuccess;
     }
-    uint64_t               GetRequestedDataTransferCount(SCSIParallelTaskIdentifier) { return 0; }
-    void                   SetRealizedDataTransferCount(SCSIParallelTaskIdentifier, uint64_t) {}
-    void                   SetAutoSenseData(SCSIParallelTaskIdentifier, uint8_t *, uint8_t) {}
-    void                   CompleteParallelTask(SCSIParallelTaskIdentifier,
-                                               SCSIServiceResponse, SCSITaskStatus) {}
-    void                  *GetDispatchQueue() { return nullptr; }
+    virtual kern_return_t UserDoesHBAPerformAutoSense(bool *r) {
+        if (r) *r = false; return kIOReturnSuccess;
+    }
+
+    // Optional overrides
+    virtual kern_return_t UserDoesHBAPerformDeviceManagement(bool *r) {
+        if (r) *r = false; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserReportMaximumTaskCount(uint32_t *c) {
+        if (c) *c = 512; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserReportHighestSupportedDeviceID(uint64_t *id) {
+        if (id) *id = 255; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserReportInitiatorIdentifier(uint64_t *id) {
+        if (id) *id = 7; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserReportHBAHighestLogicalUnitNumber(uint64_t *v) {
+        if (v) *v = 255; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserReportHBAConstraints(OSDictionary *) {
+        return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserGetDMASpecification(
+        uint64_t *sz, uint32_t *align, uint8_t *bits, DMAOutputSegmentType *seg) {
+        if (sz)    *sz    = 1024*1024;
+        if (align) *align = 4;
+        if (bits)  *bits  = 64;
+        if (seg)   *seg   = kIODMACommandOutputSegments64;
+        return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserAbortTaskRequest(
+        uint64_t, uint64_t, uint64_t, uint32_t *r) {
+        if (r) *r = kSCSIServiceResponse_Request_In_Process; return kIOReturnSuccess;
+    }
+    virtual kern_return_t UserAbortTaskSetRequest(
+        uint64_t, uint64_t, uint32_t *r) {
+        if (r) *r = kSCSIServiceResponse_Request_In_Process; return kIOReturnSuccess;
+    }
+
+    // Framework callback — driver calls this when I/O completes
+    void ParallelTaskCompletion(OSAction *, SCSIUserParallelResponse) {}
+
+    // Framework helper
+    void *GetDispatchQueue() { return nullptr; }
 };
 
-// Stub DriverKit helper macros
-#define IMPL(cls, method)
-#define OSDynamicCast(T, obj)   (static_cast<T *>(obj))
-#define OSSafeReleaseNULL(p)    do { if (p) { (p)->release(); (p) = nullptr; } } while (0)
-#define OSMemberFunctionCast(T, obj, fn)  ((T)nullptr)
-#define MIN(a, b)               ((a) < (b) ? (a) : (b))
+// ---------------------------------------------------------------------------
+// DriverKit compiler macros
+// ---------------------------------------------------------------------------
 
-// Stub memory ordering (no-ops in userspace tests)
-#define OSSynchronizeIO()       do {} while (0)
-#define IODelay(us)             do {} while (0)
-#define IOSleep(ms)             do {} while (0)
+// IMPL: in DriverKit the method body is written as IMPL(Class, Method)(args).
+// For unit tests we just define IMPL as the standard method definition.
+#define IMPL(cls, method)   cls::method
 
-// Stub PCI config offsets
+// SUPERDISPATCH: sentinel for calling base-class implementation.
+// In tests we define it as an extra ignored argument.
+#define SUPERDISPATCH       0
+
+#define OSDeclareDefaultStructors(cls)   /* no-op in unit tests */
+
+#define OSDynamicCast(T, obj)            (static_cast<T *>(obj))
+#define OSSafeReleaseNULL(p)             do { \
+    if (p) { (p)->release(); (p) = nullptr; } } while (0)
+#define OSMemberFunctionCast(T, obj, fn) ((T)nullptr)
+
+// ---------------------------------------------------------------------------
+// Platform / timing stubs
+// ---------------------------------------------------------------------------
+
+#define OSSynchronizeIO()   do {} while (0)
+#define IODelay(us)         do {} while (0)
+#define IOSleep(ms)         do {} while (0)
+
+// ---------------------------------------------------------------------------
+// PCI constants
+// ---------------------------------------------------------------------------
+
 #define kIOPCIConfigurationOffsetCommand    4
 #define kIOPCIMemoryRangeBAR1               1
 #define kIOPCICommandBusMaster              (1 << 2)
 #define kIOPCICommandMemorySpace            (1 << 1)
 #define kIOMemoryDirectionInOut             0
 
-// Stub MMIO read/write (return 0 for reads, ignore writes)
-static inline uint32_t OSReadLittleInt32(const volatile void *base, uint32_t offset) {
-    (void)base; (void)offset; return 0;
-}
-static inline void OSWriteLittleInt32(volatile void *base, uint32_t offset, uint32_t value) {
-    (void)base; (void)offset; (void)value;
-}
+// ---------------------------------------------------------------------------
+// DMA constraint dictionary keys
+// ---------------------------------------------------------------------------
 
-// Stub os_log
-#define os_log(log, fmt, ...)     printf(fmt "\n", ##__VA_ARGS__)
+#define kIOMaximumSegmentAddressableBitCountKey  "IOMaximumSegmentAddressableBitCount"
+#define kIOMaximumSegmentCountReadKey            "IOMaximumSegmentCountRead"
+#define kIOMaximumSegmentCountWriteKey           "IOMaximumSegmentCountWrite"
+#define kIOMaximumByteCountReadKey               "IOMaximumByteCountRead"
+#define kIOMaximumByteCountWriteKey              "IOMaximumByteCountWrite"
+
+// ---------------------------------------------------------------------------
+// Logging stubs
+// ---------------------------------------------------------------------------
+
+#define os_log(log, fmt, ...)       printf(fmt "\n", ##__VA_ARGS__)
 #define os_log_error(log, fmt, ...) printf("[ERR] " fmt "\n", ##__VA_ARGS__)
 #define os_log_debug(log, fmt, ...) do {} while (0)
-#define OS_LOG_DEFAULT            0
+#define OS_LOG_DEFAULT              ((void*)0)
 
 #endif /* UNIT_TEST */
