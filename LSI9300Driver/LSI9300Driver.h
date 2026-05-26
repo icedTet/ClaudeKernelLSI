@@ -16,6 +16,7 @@
 #pragma once
 
 #include <DriverKit/DriverKit.h>
+#include <DriverKit/OSDynamicCast.h>      // OSDeclareDefaultStructors, OSDynamicCast
 #include <DriverKit/IOService.h>
 #include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/IOInterruptDispatchSource.h>

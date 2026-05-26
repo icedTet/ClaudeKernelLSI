@@ -46,12 +46,20 @@ DK_VERSION    := $(shell $(XCRUN) --sdk driverkit --show-sdk-version 2>/dev/null
 
 ifneq ($(DK_SDK_PATH),)
   DK_TARGET     := $(ARCH)-apple-driverkit$(DK_VERSION)
-  DK_FW_PATH    := $(DK_SDK_PATH)/System/Library/Frameworks
+  # DriverKit 22+ (Xcode 14+) reorganised the SDK: extension-side frameworks
+  # now live under System/DriverKit/System/Library/Frameworks rather than the
+  # old System/Library/Frameworks.  The old path still exists in newer SDKs
+  # but contains host-side stubs that lack OSDeclareDefaultStructors and the
+  # virtual-method declarations needed by dext authors.  Use wildcard to pick
+  # the correct path at build time, falling back to the legacy layout.
+  _DK_FW_DEXT   := $(DK_SDK_PATH)/System/DriverKit/System/Library/Frameworks
+  _DK_FW_LEGACY := $(DK_SDK_PATH)/System/Library/Frameworks
+  DK_FW_PATH    := $(if $(wildcard $(_DK_FW_DEXT)/DriverKit.framework),$(_DK_FW_DEXT),$(_DK_FW_LEGACY))
   # -isysroot sets the compiler header search root (not --sysroot, which is
   # a linker flag and triggers -Wincompatible-sysroot when targeting DriverKit).
-  # -iframework adds the SDK's framework directory to the preprocessor search
-  # path so #include <DriverKit/DriverKit.h> etc. resolve correctly.
-  # -F adds the same directory to the framework linker search path.
+  # -iframework / -F add the extension SDK framework directory so that
+  # #include <DriverKit/DriverKit.h>, <PCIDriverKit/…>, and
+  # <SCSIControllerDriverKit/…> all resolve to the dext-side headers.
   DK_COMPILE    := -isysroot $(DK_SDK_PATH) -iframework $(DK_FW_PATH)
   DK_LINK       := -isysroot $(DK_SDK_PATH) -F$(DK_FW_PATH)
 else
@@ -151,6 +159,7 @@ endif
 	@echo "DriverKit SDK: $(DK_SDK_PATH)"
 	@echo "DriverKit version: $(DK_VERSION)"
 	@echo "Target triple: $(DK_TARGET)"
+	@echo "Framework path: $(DK_FW_PATH)"
 
 # =============================================================================
 # Compile driver objects
