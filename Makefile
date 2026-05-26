@@ -22,39 +22,45 @@
 DRIVER_NAME   := LSI9300Driver
 BUNDLE_ID     := com.claudekernellsi.driver.LSI9300Driver
 ARCH          := arm64
-MIN_MACOS     := 12.0
 BUILD_DIR     := build
 DEXT_DIR      := $(BUILD_DIR)/$(DRIVER_NAME).dext
 DEXT_CONTENTS := $(DEXT_DIR)/Contents
 
 # =============================================================================
-# Toolchain
+# Toolchain — DriverKit SDK
+#
+# DriverKit extensions MUST be compiled against the DriverKit SDK, not the
+# macOS SDK.  PCIDriverKit/ and SCSIControllerDriverKit/ headers do not exist
+# in the macOS SDK.
+#
+# SDK path: xcrun --sdk driverkit --show-sdk-path
+# Target triple: arm64-apple-driverkit<version>   (NOT arm64-apple-macos*)
 # =============================================================================
 
 CXX           := clang++
 XCRUN         := xcrun
-SDK_PATH      := $(shell $(XCRUN) --sdk macosx --show-sdk-path 2>/dev/null)
 
-# If we're on macOS with Xcode, use the proper sysroot
-ifneq ($(SDK_PATH),)
-SYSROOT_FLAGS  := --sysroot $(SDK_PATH)
-FRAMEWORK_PATH := $(SDK_PATH)/System/Library/Frameworks
-FW_FLAGS       := -iframework $(FRAMEWORK_PATH)
+# Resolve the DriverKit SDK (requires Xcode 12+)
+DK_SDK_PATH   := $(shell $(XCRUN) --sdk driverkit --show-sdk-path 2>/dev/null)
+DK_VERSION    := $(shell $(XCRUN) --sdk driverkit --show-sdk-version 2>/dev/null)
+
+ifneq ($(DK_SDK_PATH),)
+  DK_SYSROOT    := --sysroot $(DK_SDK_PATH)
+  DK_TARGET     := $(ARCH)-apple-driverkit$(DK_VERSION)
 else
-# Fallback for Linux CI (tests only — dext build requires macOS)
-SYSROOT_FLAGS  :=
-FW_FLAGS       :=
+  # Not on macOS / no Xcode — unit-test target still works without this.
+  DK_SYSROOT    :=
+  DK_TARGET     := $(ARCH)-apple-driverkit22.0
 endif
 
 # =============================================================================
-# Compiler flags
+# Compiler flags  (DriverKit target)
 # =============================================================================
 
 CXXFLAGS := \
     -std=c++17 \
-    -target $(ARCH)-apple-macos$(MIN_MACOS) \
-    $(SYSROOT_FLAGS) \
-    $(FW_FLAGS) \
+    -target $(DK_TARGET) \
+    $(DK_SYSROOT) \
     -Wall \
     -Wextra \
     -Wpedantic \
@@ -68,12 +74,12 @@ CXXFLAGS := \
 INCLUDES := -I LSI9300Driver
 
 # =============================================================================
-# Linker flags
+# Linker flags  (DriverKit target)
 # =============================================================================
 
 LDFLAGS := \
-    -target $(ARCH)-apple-macos$(MIN_MACOS) \
-    $(SYSROOT_FLAGS) \
+    -target $(DK_TARGET) \
+    $(DK_SYSROOT) \
     -framework DriverKit \
     -framework PCIDriverKit \
     -framework SCSIControllerDriverKit
@@ -129,10 +135,14 @@ TEST_BINS := \
 all: check-sdk dext
 
 check-sdk:
-ifeq ($(SDK_PATH),)
-	$(warning macOS SDK not found — dext build requires Xcode on macOS.)
-	$(warning Run 'make tests' to build and run unit tests only.)
+ifeq ($(DK_SDK_PATH),)
+	$(error DriverKit SDK not found. Install Xcode (12+) and run:\
+	  xcrun --sdk driverkit --show-sdk-path\
+	  \nThe dext build requires macOS with Xcode. For unit tests only, run: make tests)
 endif
+	@echo "DriverKit SDK: $(DK_SDK_PATH)"
+	@echo "DriverKit version: $(DK_VERSION)"
+	@echo "Target triple: $(DK_TARGET)"
 
 # =============================================================================
 # Compile driver objects
@@ -218,7 +228,7 @@ $(BUILD_DIR)/mpt3_reply_queue_tests: Tests/MPT3ReplyQueueTests.cpp \
 # Lint
 # =============================================================================
 
-lint:
+lint: check-sdk
 	clang-tidy \
 	    $(DRIVER_SRCS) \
 	    -- $(CXXFLAGS) $(INCLUDES) 2>&1 | head -100
