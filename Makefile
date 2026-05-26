@@ -45,12 +45,20 @@ DK_SDK_PATH   := $(shell $(XCRUN) --sdk driverkit --show-sdk-path 2>/dev/null)
 DK_VERSION    := $(shell $(XCRUN) --sdk driverkit --show-sdk-version 2>/dev/null)
 
 ifneq ($(DK_SDK_PATH),)
-  DK_SYSROOT    := --sysroot $(DK_SDK_PATH)
   DK_TARGET     := $(ARCH)-apple-driverkit$(DK_VERSION)
+  DK_FW_PATH    := $(DK_SDK_PATH)/System/Library/Frameworks
+  # -isysroot sets the compiler header search root (not --sysroot, which is
+  # a linker flag and triggers -Wincompatible-sysroot when targeting DriverKit).
+  # -iframework adds the SDK's framework directory to the preprocessor search
+  # path so #include <DriverKit/DriverKit.h> etc. resolve correctly.
+  # -F adds the same directory to the framework linker search path.
+  DK_COMPILE    := -isysroot $(DK_SDK_PATH) -iframework $(DK_FW_PATH)
+  DK_LINK       := -isysroot $(DK_SDK_PATH) -F$(DK_FW_PATH)
 else
   # Not on macOS / no Xcode — unit-test target still works without this.
-  DK_SYSROOT    :=
   DK_TARGET     := $(ARCH)-apple-driverkit22.0
+  DK_COMPILE    :=
+  DK_LINK       :=
 endif
 
 # =============================================================================
@@ -60,7 +68,7 @@ endif
 CXXFLAGS := \
     -std=c++17 \
     -target $(DK_TARGET) \
-    $(DK_SYSROOT) \
+    $(DK_COMPILE) \
     -Wall \
     -Wextra \
     -Wpedantic \
@@ -79,7 +87,7 @@ INCLUDES := -I LSI9300Driver
 
 LDFLAGS := \
     -target $(DK_TARGET) \
-    $(DK_SYSROOT) \
+    $(DK_LINK) \
     -framework DriverKit \
     -framework PCIDriverKit \
     -framework SCSIControllerDriverKit
