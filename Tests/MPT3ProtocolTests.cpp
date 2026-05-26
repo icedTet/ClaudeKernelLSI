@@ -74,7 +74,7 @@ static void TestStructSizes(void)
     // IOC handshake frames
     EXPECT_EQ(sizeof(MPT3IOCFactsRequest), 32UL);
     EXPECT_EQ(sizeof(MPT3IOCFactsReply), 68UL);
-    EXPECT_EQ(sizeof(MPT3IOCInitRequest), 80UL);
+    EXPECT_EQ(sizeof(MPT3IOCInitRequest), 68UL);  // MPI 2.5 spec: Mpi2IOCInitRequest_t = 0x44
 
     // SCSI IO frame — must be exactly MPT3_REQUEST_FRAME_SIZE
     EXPECT_EQ(sizeof(MPT3SCSIIORequest), (size_t)MPT3_REQUEST_FRAME_SIZE);

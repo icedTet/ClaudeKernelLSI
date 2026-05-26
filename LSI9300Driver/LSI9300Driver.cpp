@@ -382,20 +382,35 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
         return kIOReturnTimeout;
     }
 
-    // 6. Read reply length from doorbell (low 16 bits, in DWORDS)
-    uint32_t replyLenDW = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFF;
+    // 6. Read reply length (in DWORDs) from the doorbell register.
+    //    The IOC writes the DWORD count into bits 15:0 of the doorbell.
+    uint32_t replyLenDW = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
     if (replyLenDW == 0 || replyLenDW > replyWords) {
-        LSI_ERR("DoorbellHandshake: bad reply length %u", replyLenDW);
+        LSI_ERR("DoorbellHandshake: bad reply length %u DW (max %u)",
+                replyLenDW, replyWords);
         return kIOReturnBadArgument;
     }
 
-    // Acknowledge doorbell interrupt
+    // Acknowledge the "reply-ready" doorbell interrupt before reading data
     WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
 
-    // 7. Read reply words
+    // 7. Read reply data.
+    //
+    // IMPORTANT: The doorbell data path is only 16 bits wide.  The IOC
+    // delivers ONE 16-bit half-word per interrupt, so each 32-bit DWORD
+    // in the reply requires TWO separate interrupt-driven reads.
+    //
+    // Sequence per DWORD:
+    //   a. Wait for DOORBELL_STATUS interrupt (low half-word ready)
+    //   b. Read & acknowledge — saves bits 15:0
+    //   c. Wait for DOORBELL_STATUS interrupt (high half-word ready)
+    //   d. Read & acknowledge — saves bits 31:16
+    //   e. Reassemble: reply[i] = lo | (hi << 16)
+    //
+    // Reference: Linux mpt3sas _base_handshake_req_reply_wait()
     for (uint32_t i = 0; i < replyLenDW; i++) {
-        // Wait for each word to be ready
+        // --- low half-word ---
         timeout = 200;
         while (timeout--) {
             IODelay(10);
@@ -404,10 +419,33 @@ kern_return_t LSI9300Driver::DoorbellHandshake(const uint32_t *req,
                 break;
             }
         }
-        reply[i] = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFF;
-        // Acknowledge each word
+        if (timeout == 0) {
+            LSI_ERR("DoorbellHandshake: timeout reading reply word %u (low)", i);
+            return kIOReturnTimeout;
+        }
+        uint32_t lo = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
         WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                    MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
+
+        // --- high half-word ---
+        timeout = 200;
+        while (timeout--) {
+            IODelay(10);
+            if (ReadReg32(MPI3_SYSIF_HOST_INT_STATUS_REG) &
+                MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS) {
+                break;
+            }
+        }
+        if (timeout == 0) {
+            LSI_ERR("DoorbellHandshake: timeout reading reply word %u (high)", i);
+            return kIOReturnTimeout;
+        }
+        uint32_t hi = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
+        WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
+                   MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
+
+        // Reassemble the full DWORD (little-endian: low half first)
+        reply[i] = lo | (hi << 16);
     }
 
     return kIOReturnSuccess;
@@ -509,12 +547,36 @@ kern_return_t LSI9300Driver::AllocateDMAPools(void)
                     "RequestFrames");
     if (ret != kIOReturnSuccess) return ret;
 
-    // 2. Reply frame (free queue) pool
+    // 2a. Reply frame pool  (the actual 128-byte reply frames)
     ret = allocPool(&fReplyFramePool,
                     &fReplyFramePhysBase,
                     reinterpret_cast<void **>(&fReplyFrameVirtBase),
                     kNumReplyFrames * MPT3_REPLY_FRAME_SIZE,
                     "ReplyFrames");
+    if (ret != kIOReturnSuccess) return ret;
+
+    // Verify reply frames are in the first 4 GiB (MPI2 spec requirement).
+    // The reply free queue uses 32-bit entries; bits 63:32 must be zero.
+    if ((fReplyFramePhysBase >> 32) != 0) {
+        LSI_ERR("AllocateDMAPools: reply frame pool above 4 GiB (0x%llx) — "
+                "not supported by MPI2 32-bit free queue entries",
+                fReplyFramePhysBase);
+        return kIOReturnNoResources;
+    }
+
+    // 2b. Reply free queue ring
+    //
+    // A DMA ring of uint32_t entries, each holding the 32-bit physical
+    // address of one reply frame.  The IOC reads from this ring to find a
+    // free reply frame to write its next reply into.
+    //
+    // This is NOT a register — it is a memory-mapped DMA buffer.
+    // Its physical address goes into IOCInit.ReplyFreeQueueAddress.
+    ret = allocPool(&fReplyFreeQueueRing,
+                    &fReplyFreeRingPhys,
+                    reinterpret_cast<void **>(&fReplyFreeRingVirt),
+                    kNumReplyFrames * sizeof(uint32_t),
+                    "ReplyFreeQueueRing");
     if (ret != kIOReturnSuccess) return ret;
 
     // 3. Reply post queue (descriptor ring) — must be cache-coherent
@@ -557,68 +619,108 @@ void LSI9300Driver::FreeDMAPools(void)
 {
     OSSafeReleaseNULL(fSenseBufferPool);
     OSSafeReleaseNULL(fReplyPostQueue);
+    OSSafeReleaseNULL(fReplyFreeQueueRing);
     OSSafeReleaseNULL(fReplyFramePool);
     OSSafeReleaseNULL(fRequestFramePool);
     fRequestFrameVirtBase = nullptr;
     fReplyFrameVirtBase   = nullptr;
+    fReplyFreeRingVirt    = nullptr;
     fReplyPostVirtBase    = nullptr;
     fSenseVirtBase        = nullptr;
 }
 
 // ===========================================================================
-// FillReplyFreeQueue — give the IOC all pre-allocated reply frame addresses
+// FillReplyFreeQueue — populate the reply free queue DMA ring
 // ===========================================================================
+//
+// The reply free queue is a DMA ring of uint32_t physical addresses.  The IOC
+// reads entries from this ring to find a reply frame it can write a reply into.
+//
+// Correct protocol (MPI 2.5 spec, Section 5.4):
+//   1. Write each reply frame's 32-bit PA into the DMA ring slots.
+//   2. After filling N slots, write N to REPLY_FREE_HOST_INDEX_REG to inform
+//      the IOC how many entries are available.
+//
+// This function must be called AFTER AllocateDMAPools (which verifies the
+// frame pool is below 4 GiB) and BEFORE SendIOCInit.
 
 void LSI9300Driver::FillReplyFreeQueue(void)
 {
     for (uint32_t i = 0; i < kNumReplyFrames; i++) {
         uint64_t phys = fReplyFramePhysBase + i * MPT3_REPLY_FRAME_SIZE;
-        // The reply free queue register takes 32-bit words; we write the low
-        // 32 bits (physical address >> 1 per spec, aligned to 128-byte frames)
-        WriteReg32(MPI3_SYSIF_REPLY_FREE_HOST_INDEX_REG,
-                   static_cast<uint32_t>(phys >> 1));
+        // Store the 32-bit PA into the DMA ring (not a register write)
+        fReplyFreeRingVirt[i] = static_cast<uint32_t>(phys & 0xFFFFFFFFULL);
     }
+
+    // Flush write ordering: ensure all ring entries are in memory before
+    // we tell the IOC the ring is populated
+    OSSynchronizeIO();
+
+    // Inform the IOC that kNumReplyFrames entries are available in the ring
     fReplyFreeIndex = kNumReplyFrames;
+    WriteReg32(MPI3_SYSIF_REPLY_FREE_HOST_INDEX_REG, fReplyFreeIndex);
 }
 
 // ===========================================================================
 // SendIOCInit
 // ===========================================================================
+//
+// Sends an IOCInit message via the doorbell handshake to configure the four
+// DMA ring addresses in the firmware:
+//
+//   SystemRequestFrameBaseAddress  — where the host puts SCSI IO requests
+//   ReplyDescriptorPostQueueAddress — where the IOC writes reply descriptors
+//   ReplyFreeQueueAddress           — where the host puts free reply frame PAs
+//   SenseBufferAddressHigh          — upper 32 bits of the sense buffer pool
+//
+// All addresses are populated from the DMA pools allocated by AllocateDMAPools.
 
 kern_return_t LSI9300Driver::SendIOCInit(void)
 {
     MPT3IOCInitRequest req = {};
-    req.Header.Function     = MPI3_FUNCTION_IOC_INIT;
-    req.WhoInit             = 0x03U;   // 0x03 = IT (no RAID)
-    req.MsgVersion          = 0x0200U; // MPI 2.0
 
-    // Reply post queue physical address
-    req.ReplyDescriptorPostQueueAddress_Low  =
-        static_cast<uint32_t>(fReplyPostPhysBase & 0xFFFFFFFFULL);
-    req.ReplyDescriptorPostQueueAddress_High =
-        static_cast<uint32_t>(fReplyPostPhysBase >> 32);
+    // --- Function header ---
+    req.Function    = MPI3_FUNCTION_IOC_INIT;
+    req.WhoInit     = 0x04U;    // MPI2_WHOINIT_HOST_DRIVER
+    req.MsgVersion  = 0x0200U;  // MPI 2.0 base protocol version
+    req.HostMSIxVectors = 1;    // one MSI-X vector in this release
 
-    // Reply free queue physical address
-    req.FreeReplyDescriptorPostQueueAddress_Low  =
-        static_cast<uint32_t>(fReplyFramePhysBase & 0xFFFFFFFFULL);
-    req.FreeReplyDescriptorPostQueueAddress_High =
-        static_cast<uint32_t>(fReplyFramePhysBase >> 32);
+    // --- Request frame pool ---
+    // The IOC validates SMID-indexed request frames against this base address.
+    req.SystemRequestFrameBaseAddress =
+        fRequestFramePhysBase;
+    req.SystemRequestFrameSize =
+        static_cast<uint16_t>(MPT3_REQUEST_FRAME_SIZE / sizeof(uint32_t));
 
-    // Sense buffer high address (we use 64-bit sense addresses)
+    // --- Sense buffer pool ---
+    // Only the upper 32 bits are sent; all sense buffers must share the same
+    // upper 32 bits as the reply frame pool (guaranteed by our 4 GiB assertion).
     req.SenseBufferAddressHigh =
         static_cast<uint32_t>(fSensePhysBase >> 32);
 
-    req.ReplyDescriptorPostQueueDepth = static_cast<uint16_t>(kReplyQueueDepth);
-    req.ReplyFreeQueueDepth           = static_cast<uint16_t>(kNumReplyFrames);
+    // --- Reply post queue ring (IOC → host reply descriptors) ---
+    req.ReplyDescriptorPostQueueAddress =
+        fReplyPostPhysBase;
+    req.ReplyDescriptorPostQueueDepth =
+        static_cast<uint16_t>(kReplyQueueDepth);
+
+    // --- Reply free queue ring (host → IOC free reply frame pool) ---
+    // This points to the DMA ring of uint32_t physical addresses populated
+    // by FillReplyFreeQueue(), NOT to the reply frame pool directly.
+    req.ReplyFreeQueueAddress =
+        fReplyFreeRingPhys;
+    req.ReplyFreeQueueDepth =
+        static_cast<uint16_t>(kNumReplyFrames);
 
     static_assert(sizeof(req) % 4 == 0, "IOCInit must be DWORD-aligned");
 
     MPT3IOCInitReply reply = {};
+    uint32_t replyWords = sizeof(reply) / sizeof(uint32_t);
     kern_return_t ret = DoorbellHandshake(
                             reinterpret_cast<const uint32_t *>(&req),
                             sizeof(req) / sizeof(uint32_t),
                             reinterpret_cast<uint32_t *>(&reply),
-                            sizeof(reply) / sizeof(uint32_t));
+                            replyWords);
     if (ret != kIOReturnSuccess) {
         return ret;
     }
@@ -626,7 +728,9 @@ kern_return_t LSI9300Driver::SendIOCInit(void)
         LSI_ERR("SendIOCInit: IOCStatus=0x%04x", reply.IOCStatus);
         return kIOReturnDeviceError;
     }
-    LSI_LOG("SendIOCInit: IOC operational, reply queues configured");
+    LSI_LOG("SendIOCInit: IOC operational — request pool 0x%llx, "
+            "reply post 0x%llx, reply free ring 0x%llx",
+            fRequestFramePhysBase, fReplyPostPhysBase, fReplyFreeRingPhys);
     return kIOReturnSuccess;
 }
 
@@ -721,8 +825,17 @@ void LSI9300Driver::PostRequestDescriptor(uint32_t low, uint32_t high)
     WriteReg32(MPI3_SYSIF_REQUEST_DESCRIPTOR_POST_HIGH_REG, high);
 }
 
-void LSI9300Driver::AdvanceReplyFreeIndex(void)
+void LSI9300Driver::ReturnReplyFrameToFreeQueue(uint64_t replyFramePhys)
 {
+    // Write the 32-bit PA of the consumed reply frame into the next slot
+    // of the reply free queue DMA ring, then advance the producer index.
+    fReplyFreeRingVirt[fReplyFreeIndex] =
+        static_cast<uint32_t>(replyFramePhys & 0xFFFFFFFFULL);
+
+    // OSSynchronizeIO() before the register write ensures the DMA ring
+    // entry is visible to the IOC before the index register update
+    OSSynchronizeIO();
+
     fReplyFreeIndex = (fReplyFreeIndex + 1) % kNumReplyFrames;
     WriteReg32(MPI3_SYSIF_REPLY_FREE_HOST_INDEX_REG, fReplyFreeIndex);
 }
@@ -932,8 +1045,8 @@ void LSI9300Driver::HandleInterrupt(IOInterruptDispatchSource * /*source*/,
                                   hdr->Function);
                         break;
                 }
-                // Return the reply frame to the free queue
-                AdvanceReplyFreeIndex();
+                // Return the reply frame to the IOC's free pool
+                ReturnReplyFrameToFreeQueue(replyPhys);
             }
         }
 

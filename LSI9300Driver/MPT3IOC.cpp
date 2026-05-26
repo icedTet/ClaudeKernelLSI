@@ -234,18 +234,36 @@ kern_return_t MPT3IOCManager::DoorbellHandshake(const uint32_t *req,
     WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
 
-    // 6. Read reply DWORDs (each one requires waiting for the doorbell bit)
+    // 6. Read reply data.
+    //
+    // The doorbell is 16 bits wide.  The IOC delivers ONE 16-bit half-word
+    // per DOORBELL_STATUS interrupt, so reconstructing each 32-bit DWORD
+    // requires TWO reads (low half-word first, then high half-word).
+    //
+    // Reference: Linux mpt3sas _base_handshake_req_reply_wait()
     for (uint32_t i = 0; i < actualReplyDW; i++) {
+        // --- low half-word ---
         if (!waitForBit(MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS,
                         true, kDoorbellWordRetries)) {
-            IOC_ERR("DoorbellHandshake: timeout reading reply word %u", i);
+            IOC_ERR("DoorbellHandshake: timeout reading reply word %u (low)", i);
             return kIOReturnTimeout;
         }
-        reply[i] = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
-
-        // Acknowledge each reply word
+        uint32_t lo = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
         WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
                    MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
+
+        // --- high half-word ---
+        if (!waitForBit(MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS,
+                        true, kDoorbellWordRetries)) {
+            IOC_ERR("DoorbellHandshake: timeout reading reply word %u (high)", i);
+            return kIOReturnTimeout;
+        }
+        uint32_t hi = ReadReg32(MPI3_SYSIF_DOORBELL_REG) & 0xFFFFU;
+        WriteReg32(MPI3_SYSIF_HOST_INT_STATUS_REG,
+                   MPI3_SYSIF_HOST_INT_STATUS_DOORBELL_STATUS);
+
+        // Reassemble full DWORD (little-endian: low half first)
+        reply[i] = lo | (hi << 16);
     }
 
     // 7. Wait for the IOC to deassert the doorbell interrupt (handshake done)
@@ -333,34 +351,41 @@ kern_return_t MPT3IOCManager::RunInitSequence(MPT3IOCFactsReply *outFacts)
 // SendIOCInit
 // ===========================================================================
 
-kern_return_t MPT3IOCManager::SendIOCInit(uint64_t replyPostPhys,
-                                           uint64_t replyFreePhys,
-                                           uint32_t sensePhysHigh,
+kern_return_t MPT3IOCManager::SendIOCInit(uint64_t requestFramePhys,
+                                           uint16_t requestFrameSize,
+                                           uint64_t replyPostPhys,
                                            uint16_t replyPostDepth,
-                                           uint16_t replyFreeDepth)
+                                           uint64_t replyFreeRingPhys,
+                                           uint16_t replyFreeDepth,
+                                           uint32_t sensePhysHigh,
+                                           uint16_t msixVectors)
 {
     MPT3IOCInitRequest req = {};
-    req.Header.Function = MPI3_FUNCTION_IOC_INIT;
-    req.WhoInit         = 0x03U;   // 0x03 = IT initiator / no RAID
-    req.MsgVersion      = 0x0200U; // MPI 2.0 (big picture version field)
 
-    req.ReplyDescriptorPostQueueAddress_Low  =
-        static_cast<uint32_t>(replyPostPhys & 0xFFFFFFFFULL);
-    req.ReplyDescriptorPostQueueAddress_High =
-        static_cast<uint32_t>(replyPostPhys >> 32);
+    // --- Function header ---
+    req.Function    = MPI3_FUNCTION_IOC_INIT;
+    req.WhoInit     = 0x04U;    // MPI2_WHOINIT_HOST_DRIVER (not 0x03)
+    req.MsgVersion  = 0x0200U;  // MPI 2.0 base protocol
+    req.HostMSIxVectors = msixVectors;
 
-    req.FreeReplyDescriptorPostQueueAddress_Low  =
-        static_cast<uint32_t>(replyFreePhys & 0xFFFFFFFFULL);
-    req.FreeReplyDescriptorPostQueueAddress_High =
-        static_cast<uint32_t>(replyFreePhys >> 32);
+    // --- Request frame pool ---
+    // IOC validates SMID-indexed request frames against this base address.
+    req.SystemRequestFrameBaseAddress = requestFramePhys;
+    req.SystemRequestFrameSize =
+        static_cast<uint16_t>(requestFrameSize / sizeof(uint32_t));
 
-    req.SenseBufferAddressHigh   = sensePhysHigh;
-    req.ReplyDescriptorPostQueueDepth = replyPostDepth;
-    req.ReplyFreeQueueDepth          = replyFreeDepth;
+    // --- Sense buffer pool ---
+    req.SenseBufferAddressHigh = sensePhysHigh;
 
-    // Timestamp (optional but useful for firmware logging)
-    // Using a placeholder; production code would use mach_absolute_time()
-    req.DriverTimestamp = 0;
+    // --- Reply post queue ring (IOC → host, 8-byte reply descriptors) ---
+    req.ReplyDescriptorPostQueueAddress = replyPostPhys;
+    req.ReplyDescriptorPostQueueDepth   = replyPostDepth;
+
+    // --- Reply free queue ring (host → IOC, 4-byte reply frame PAs) ---
+    // NOTE: replyFreeRingPhys is the PA of the uint32_t[] DMA ring, NOT
+    //       the PA of the reply frame pool itself.
+    req.ReplyFreeQueueAddress = replyFreeRingPhys;
+    req.ReplyFreeQueueDepth   = replyFreeDepth;
 
     constexpr uint32_t kMaxReplyDW = sizeof(MPT3IOCInitReply) / sizeof(uint32_t);
     uint32_t replyBuf[kMaxReplyDW] = {};
@@ -384,14 +409,16 @@ kern_return_t MPT3IOCManager::SendIOCInit(uint64_t replyPostPhys,
         return kIOReturnDeviceError;
     }
 
-    // After IOCInit, the IOC should transition to OPERATIONAL
+    // After IOCInit, the IOC transitions to OPERATIONAL
     ret = WaitForState(MPI3_IOC_STATE_OPERATIONAL, kOperTimeoutMS);
     if (ret != kIOReturnSuccess) {
         IOC_ERR("SendIOCInit: IOC did not reach OPERATIONAL state");
         return ret;
     }
 
-    IOC_LOG("SendIOCInit: IOC is OPERATIONAL — reply queues configured");
+    IOC_LOG("SendIOCInit: OPERATIONAL — reqFrames@0x%llx replyPost@0x%llx "
+            "replyFreeRing@0x%llx",
+            requestFramePhys, replyPostPhys, replyFreeRingPhys);
     return kIOReturnSuccess;
 }
 

@@ -81,21 +81,29 @@ public:
     kern_return_t RunInitSequence(MPT3IOCFactsReply *outFacts);
 
     /**
-     * Send IOCInit with pre-allocated queue addresses.
-     * Must be called after RunInitSequence succeeds and the caller has
-     * set up the DMA pools.
+     * Send IOCInit to configure all four DMA ring addresses in the firmware.
+     * Must be called after RunInitSequence and after DMA pools are allocated
+     * and the reply free queue ring has been filled (FillReplyFreeQueue).
      *
-     * @param replyPostPhys   Physical address of the reply post queue ring.
-     * @param replyFreePhys   Physical address of the reply free queue pool.
-     * @param sensePhysHigh   Upper 32 bits of the sense buffer pool PA.
-     * @param replyPostDepth  Number of slots in the reply post queue.
-     * @param replyFreeDepth  Number of slots in the reply free queue.
+     * @param requestFramePhys   PA of the request frame DMA pool.
+     * @param requestFrameSize   Size of each request frame in bytes
+     *                           (used to compute SystemRequestFrameSize in DWORDs).
+     * @param replyPostPhys      PA of the reply post queue DMA ring.
+     * @param replyPostDepth     Number of slots in the reply post ring.
+     * @param replyFreeRingPhys  PA of the reply free queue DMA ring
+     *                           (ring of uint32_t reply frame PAs — NOT the frame pool).
+     * @param replyFreeDepth     Number of slots in the reply free ring.
+     * @param sensePhysHigh      Upper 32 bits of the sense buffer pool PA.
+     * @param msixVectors        Number of MSI-X vectors the host will use.
      */
-    kern_return_t SendIOCInit(uint64_t replyPostPhys,
-                              uint64_t replyFreePhys,
-                              uint32_t sensePhysHigh,
+    kern_return_t SendIOCInit(uint64_t requestFramePhys,
+                              uint16_t requestFrameSize,
+                              uint64_t replyPostPhys,
                               uint16_t replyPostDepth,
-                              uint16_t replyFreeDepth);
+                              uint64_t replyFreeRingPhys,
+                              uint16_t replyFreeDepth,
+                              uint32_t sensePhysHigh,
+                              uint16_t msixVectors);
 
     /**
      * Issue PortEnable (async — completion arrives as an event).

@@ -203,26 +203,52 @@ MPT3_STATIC_ASSERT(sizeof(MPT3IOCFactsReply) == 68, "size mismatch");
 
 /* =========================================================================
  * IOCInit request  (sent once after IOCFacts to configure descriptor pools)
+ *
+ * Layout matches MPI 2.5 specification, Section 5.1 (Mpi2IOCInitRequest_t).
+ * Verified against Linux mpt3sas: drivers/scsi/mpt3sas/mpi/mpi2.h
+ *
+ * Key fields:
+ *   WhoInit                          = MPI2_WHOINIT_HOST_DRIVER (0x04)
+ *   MsgVersion                       = 0x0200 (MPI 2.0 base protocol)
+ *   SystemRequestFrameBaseAddress    = 64-bit PA of request frame DMA pool
+ *   SystemRequestFrameSize           = size of each request frame in DWORDs
+ *   SenseBufferAddressHigh           = upper 32 bits of sense pool PA
+ *   ReplyDescriptorPostQueueAddress  = 64-bit PA of reply post queue ring
+ *   ReplyDescriptorPostQueueDepth    = number of slots in reply post ring
+ *   ReplyFreeQueueAddress            = 64-bit PA of reply free queue ring
+ *   ReplyFreeQueueDepth              = number of slots in reply free ring
  * ========================================================================= */
 
 typedef struct {
-    MPT3RequestHeader   Header;
-    uint8_t             WhoInit;
-    uint8_t             Reserved1;
-    uint16_t            MsgVersion;         /**< 0x0200 = MPI 2.0              */
-    uint32_t            Reserved2;
-    uint32_t            ReplyDescriptorPostQueueAddress_Low;
-    uint32_t            ReplyDescriptorPostQueueAddress_High;
-    uint32_t            FreeReplyDescriptorPostQueueAddress_Low;
-    uint32_t            FreeReplyDescriptorPostQueueAddress_High;
-    uint32_t            SenseBufferAddressHigh;
-    uint16_t            ReplyDescriptorPostQueueDepth;
-    uint16_t            ReplyFreeQueueDepth;
-    uint32_t            Flags;
-    uint64_t            DriverTimestamp;    /**< Host timestamp for logging    */
-    uint8_t             Reserved3[24];
-} MPT3IOCInitRequest;
-MPT3_STATIC_ASSERT(sizeof(MPT3IOCInitRequest) == 80, "size mismatch");
+    uint8_t     WhoInit;                        /**< 0x00  MPI2_WHOINIT_HOST_DRIVER = 0x04 */
+    uint8_t     Reserved1;                      /**< 0x01 */
+    uint8_t     ChainOffset;                    /**< 0x02  0 for IOCInit (not chained) */
+    uint8_t     Function;                       /**< 0x03  = MPI3_FUNCTION_IOC_INIT */
+    uint16_t    Reserved2;                      /**< 0x04 */
+    uint8_t     Reserved3;                      /**< 0x06 */
+    uint8_t     MsgFlags;                       /**< 0x07 */
+    uint8_t     VP_ID;                          /**< 0x08 */
+    uint8_t     VF_ID;                          /**< 0x09 */
+    uint16_t    Reserved4;                      /**< 0x0A */
+    uint16_t    MsgVersion;                     /**< 0x0C  0x0200 = MPI 2.0 */
+    uint16_t    HeaderVersion;                  /**< 0x0E */
+    uint32_t    Reserved5;                      /**< 0x10 */
+    uint16_t    Reserved6;                      /**< 0x14 */
+    uint8_t     Reserved7;                      /**< 0x16 */
+    uint8_t     HostPageSize;                   /**< 0x17  0 = use firmware default */
+    uint64_t    SystemRequestFrameBaseAddress;  /**< 0x18  PA of request frame pool */
+    uint32_t    SenseBufferAddressHigh;         /**< 0x20  upper 32 bits of sense pool PA */
+    uint32_t    Reserved8;                      /**< 0x24 */
+    uint64_t    ReplyDescriptorPostQueueAddress;/**< 0x28  PA of reply post queue ring */
+    uint64_t    ReplyFreeQueueAddress;          /**< 0x30  PA of reply free queue ring */
+    uint16_t    ReplyFreeQueueDepth;            /**< 0x38 */
+    uint16_t    HostMSIxVectors;                /**< 0x3A  number of MSI-X vectors used */
+    uint16_t    Reserved9;                      /**< 0x3C */
+    uint16_t    SystemRequestFrameSize;         /**< 0x3E  frame size in DWORDs */
+    uint16_t    ReplyDescriptorPostQueueDepth;  /**< 0x40 */
+    uint16_t    Reserved10;                     /**< 0x42 */
+} MPT3IOCInitRequest;                           /**< total: 0x44 = 68 bytes */
+MPT3_STATIC_ASSERT(sizeof(MPT3IOCInitRequest) == 68, "size mismatch");
 
 /** IOC reply to IOCInit (uses generic reply header; success = IOCStatus 0) */
 typedef MPT3ReplyHeader MPT3IOCInitReply;

@@ -205,10 +205,13 @@ private:
 
     /**
      * Allocate DMA-coherent pools:
-     *   - Request frames  (kNumRequestFrames × MPT3_REQUEST_FRAME_SIZE)
-     *   - Reply free queue (kNumReplyFrames × MPT3_REPLY_FRAME_SIZE)
-     *   - Reply post queue (kReplyQueueDepth × MPT3_REPLY_DESCRIPTOR_SIZE)
-     *   - Sense buffers   (kNumRequestFrames × kSenseBufferSize)
+     *   - Request frames       (kNumRequestFrames × MPT3_REQUEST_FRAME_SIZE)
+     *   - Reply frame pool     (kNumReplyFrames   × MPT3_REPLY_FRAME_SIZE)
+     *   - Reply free queue ring (kNumReplyFrames  × sizeof(uint32_t))
+     *     [DMA ring of 32-bit reply frame PAs — IOC reads from this]
+     *   - Reply post queue ring (kReplyQueueDepth × MPT3_REPLY_DESCRIPTOR_SIZE)
+     *     [DMA ring of 8-byte reply descriptors — IOC writes to this]
+     *   - Sense buffers        (kNumRequestFrames × kSenseBufferSize)
      */
     kern_return_t   AllocateDMAPools(void);
 
@@ -216,8 +219,9 @@ private:
     void            FreeDMAPools(void);
 
     /**
-     * Populate the reply-free queue with the physical addresses of all
-     * pre-allocated reply frames, so the IOC can write replies to them.
+     * Write the physical addresses of all pre-allocated reply frames into the
+     * reply free queue DMA ring and update the host index register.
+     * Must be called after AllocateDMAPools and before SendIOCInit.
      */
     void            FillReplyFreeQueue(void);
 
@@ -260,9 +264,17 @@ private:
     void            PostRequestDescriptor(uint32_t low, uint32_t high);
 
     /**
-     * Advance the reply free host index register after consuming a reply.
+     * Return a consumed reply frame to the IOC's free pool.
+     *
+     * Writes the reply frame's 32-bit physical address into the next slot
+     * of the reply free queue DMA ring, advances the producer index, and
+     * updates the REPLY_FREE_HOST_INDEX_REG so the IOC can reuse the frame.
+     *
+     * @param replyFramePhys  Full 64-bit physical address of the reply frame.
+     *                        Must be within the first 4 GiB (bits 63:32 == 0
+     *                        or == SenseBufferAddressHigh) per MPI2 spec.
      */
-    void            AdvanceReplyFreeIndex(void);
+    void            ReturnReplyFrameToFreeQueue(uint64_t replyFramePhys);
 
     /* ------------------------------------------------------------------
      * Private helpers — I/O completion
@@ -324,12 +336,27 @@ private:
     uint64_t                        fRequestFramePhysBase = 0;
     MPT3SCSIIORequest              *fRequestFrameVirtBase = nullptr;
 
-    /** IOBufferMemoryDescriptor for the reply frame (free) pool */
+    /**
+     * Reply frame pool — actual 128-byte frames the IOC writes replies into.
+     * Physical addresses of these frames are placed in the free queue ring.
+     */
     IOBufferMemoryDescriptor       *fReplyFramePool      = nullptr;
     uint64_t                        fReplyFramePhysBase  = 0;
     uint8_t                        *fReplyFrameVirtBase  = nullptr;
 
-    /** IOBufferMemoryDescriptor for the reply post queue (descriptor ring) */
+    /**
+     * Reply free queue ring — DMA ring of uint32_t physical addresses.
+     * The host fills this ring with addresses of reply frames; the IOC reads
+     * from it to obtain a frame to write a reply into.
+     * ReplyFreeQueueAddress in IOCInit points here.
+     * Entries are 32-bit (reply frames must be in the low 4 GiB).
+     */
+    IOBufferMemoryDescriptor       *fReplyFreeQueueRing  = nullptr;
+    uint64_t                        fReplyFreeRingPhys   = 0;
+    uint32_t                       *fReplyFreeRingVirt   = nullptr;
+
+    /** IOBufferMemoryDescriptor for the reply post queue (descriptor ring).
+     *  The IOC writes 8-byte reply descriptors here; the host drains on IRQ. */
     IOBufferMemoryDescriptor       *fReplyPostQueue      = nullptr;
     uint64_t                        fReplyPostPhysBase   = 0;
     MPT3ReplyDescriptor            *fReplyPostVirtBase   = nullptr;
